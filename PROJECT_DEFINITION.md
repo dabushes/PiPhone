@@ -113,14 +113,16 @@ Full keyboard navigation is enabled whenever the **Pi Dialer** tab is active:
 * **`BackSpace`**: Deletes trailing digit (`⌫`).
 * **`Escape` / `Delete`**: Clears entire input field (`CLR`).
 
-### 2.9 Interactive Checkpoint Pause Modal (10k / 100k Stepping)
-When a search misses the existing cache and calculates new digits, the engine pauses after every **10,000 newly calculated digits** (default step size):
+### 2.9 Interactive Checkpoint Pause Modal (100k / 1M Stepping & 60s Rule)
+When a search misses the existing cache and calculates new digits, the engine pauses after every **100,000 newly calculated digits** (default step size):
 * **Modal Dialog (`CTkToplevel`)**: Centered over main window, blocking main window interactions (`grab_set()`).
-* **Message**: *"Match not found yet. Calculated X,XXX new digits (Total Pi Digits Cached: Y,YYY,YYY). Would you like to continue searching?"*
-* **Three Actions**:
-  1. **`Continue (+10,000)`**: Calculates next 10,000 digits before pausing again.
-  2. **`Continue (+100,000)`**: Dynamically switches step size to 100,000 digits before pausing again.
-  3. **`Stop Search`**: Halts search, saves all computed digits and index entries to disk, updates the History tab banner, and resets UI state.
+* **Live Empirical Time Estimates**: Button labels dynamically display estimated wall-clock calculation durations derived from the empirical scaling formula:
+  * **`Continue (+100,000) [~X.Xs]`**
+  * **`Continue (+1,000,000) [~Y.Ys]`** *(conditionally visible)*
+  * **`Stop Search`**: Halts search, saves all computed digits and index entries to disk, updates the History tab banner, and resets UI state.
+* **60-Second Time-Ceiling Rule**:
+  * Before opening the modal, the engine computes $T_{\text{est}}$ for `+1,000,000` digits.
+  * If $T_{\text{est}}(1,000,000) > 60.0\text{s}$, the `Continue (+1,000,000)` button is **automatically hidden**, and a subtle explanatory note is displayed in the modal prompt (`"(Note: +1,000,000 option hidden: estimated time > 60s)"`), preventing runaway calculations.
 
 ---
 
@@ -142,19 +144,28 @@ flowchart TD
     K -- Yes --> L[Append Digits to data/pi_digits.txt]
     L --> M[Update Sorted Index via Timsort]
     M --> N[Notify UI via Thread-Safe Queue]
-    K -- No --> O{User Clicked Cancel?}
+    K -- No --> O{User Clicked Cancel / Stop?}
     O -- Yes --> P[Clean Cancellation & Persist Digits]
-    O -- No --> I
+    O -- No --> Q{Checkpoint Pause: Modal Action}
+    Q -- '+100,000' --> I
+    Q -- '+1,000,000' --> I
+    Q -- 'Stop' --> P
 ```
 
-### 3.1 Pi Calculation Engine (Chudnovsky Algorithm)
+### 3.1 Hardware-Accelerated Pi Calculation Engine (`gmpy2` + `mpmath`)
 The calculation engine uses the Ramanujan-Chudnovsky hypergeometric series:
 
 $$\frac{1}{\pi} = 12 \sum_{k=0}^{\infty} \frac{(-1)^k (6k)! (545140134k + 13591409)}{(3k)! (k!)^3 (640320)^{3k + 3/2}}$$
 
-* **Convergence Rate**: ~14.181647 decimal digits per term.
-* **Precision Control**: Configured through `mpmath.mp.dps` with appropriate guard digits to eliminate boundary roundoff errors.
-* **Fallback & Optimization**: Primary calculation implemented using Python's high-precision `mpmath`. If the optional C-accelerated library `gmpy2` is installed in the environment, it is automatically leveraged for greater computational throughput.
+* **Hardware Acceleration via `gmpy2`**:
+  * Leverages compiled C GNU Multiple Precision Arithmetic (GMP/MPFR/MPC) backend via `gmpy2`.
+  * `mpmath` automatically detects and binds `mpmath.libmp.BACKEND == 'gmpy'`, delivering **10x–15x higher throughput** than pure Python.
+  * Graceful fallback to pure Python `BACKEND == 'python'` if `gmpy2` is not present.
+* **Empirical Time Estimation Engine**:
+  * Calculation time scales super-linearly with total precision $N = \text{current\_total} + \text{chunk\_delta}$.
+  * The engine records the exact duration ($T_{\text{last}}$) and digit count ($N_{\text{last}}$) of recent calculations and computes:
+    $$T_{\text{est}} = T_{\text{last}} \times \left(\frac{\text{current\_total} + \text{chunk\_delta}}{N_{\text{last}}}\right)^{1.35}$$
+  * Accurately drives human-readable modal button labels (`[< 0.1s]`, `[~1.4s]`, `[~42s]`, `[~1.5m]`).
 
 ### 3.2 Persistent Raw Stream (`data/pi_digits.txt`)
 * **Format**: Plain ASCII text file containing contiguous decimal digits of $\pi$ directly following `3.`.

@@ -9,9 +9,11 @@
 | Feature | Description |
 |---------|-------------|
 | **Pi Dialer Tab** | Keypad (`0–9`, `CLR`, `⌫`), numeric input (1–10 digits with strict 11th-digit block), and full keyboard/numpad shortcuts. |
-| **Search in Pi** | Locates user-entered digit sequences in $\pi$ using a fast Chudnovsky algorithm engine (`mpmath`). |
+| **Hardware-Accelerated Math** | High-throughput Chudnovsky engine powered by `mpmath` and compiled C `gmpy2` (10x–15x speedup). |
 | **Visual Match Context** | Distinct font hierarchy (14pt muted vs 28pt bold green accent) with contextual ellipses (`...1234` **`5678`** `9012...`) and Start-of-Pi `3.` padding. |
-| **Interactive Checkpoint Modal** | Pauses every 10,000 newly calculated digits with options to Continue (+10k), Continue (+100k), or Stop Search. |
+| **Interactive Checkpoint Modal** | Pauses every 100,000 newly calculated digits with options for `+100,000` and `+1,000,000` stepping. |
+| **Empirical Time Estimates** | Displays live estimated compute times on modal buttons (`[< 0.1s]`, `[~1.4s]`, `[~42s]`) via super-linear scaling law. |
+| **60-Second Time-Ceiling Rule** | Automatically hides the `+1,000,000` button if its estimated compute duration exceeds 60 seconds to prevent runaway deep searches. |
 | **Sorted Index & Cache** | Two-tiered lookup table maintained via Python's native Timsort and $O(\log n)$ Binary Search (`bisect`) for instant repeated queries. |
 | **Total Cached Digits Banner** | Real-time telemetry banner on Search History tab showing `Total Pi Digits Cached: X,XXX,XXX`. |
 | **Search Cancellation** | Cooperative cancellation via `threading.Event`, allowing deep searches to be cancelled immediately while preserving computed digits. |

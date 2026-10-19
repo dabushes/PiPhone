@@ -265,13 +265,13 @@ def test_tc09_ellipsis_formatting_start_of_pi_edge_case(temp_engine: PiEngine):
 
 
 # =====================================================================
-# TC-10: Checkpoint Pause & Resume Callback (10k / 100k Stepping)
+# TC-10: Checkpoint Pause & Resume Callback (100k / 1M Stepping)
 # =====================================================================
 def test_tc10_checkpoint_pause_and_resume_callback(tmp_path: Path):
     """
     TC-10: Verify that when a search misses existing cache, the engine triggers
-    the checkpoint callback after 10,000 newly calculated digits, can dynamically
-    switch step size to 100,000, and cleanly stops when given 'stop' signal.
+    the checkpoint callback after 100,000 newly calculated digits, can dynamically
+    switch step size to 1,000,000, and cleanly stops when given 'stop' signal.
     """
     engine = PiEngine(data_dir=tmp_path, default_seed_digits=500)
     initial_cached = engine.get_total_cached_digits()
@@ -282,16 +282,16 @@ def test_tc10_checkpoint_pause_and_resume_callback(tmp_path: Path):
     def checkpoint_handler(new_digits_total: int, total_cached: int):
         callback_records.append((new_digits_total, total_cached))
         if len(callback_records) == 1:
-            # First pause: step size was 10,000 -> switch to 100,000
-            return 100_000
+            # First pause: step size was 100,000 -> switch to 1,000,000
+            return 1_000_000
         else:
             # Second pause: halt search
             return "stop"
 
-    # Search for an impossible 10-digit number in first 200k digits
+    # Search for an impossible 10-digit number in first 1.2M digits
     res = engine.search(
         "9999999999",
-        chunk_size=10_000,
+        chunk_size=100_000,
         checkpoint_callback=checkpoint_handler,
     )
 
@@ -299,14 +299,14 @@ def test_tc10_checkpoint_pause_and_resume_callback(tmp_path: Path):
     assert res is None
     assert len(callback_records) == 2
 
-    # First checkpoint: calculated 10,000 new digits -> total 10,500
-    assert callback_records[0] == (10_000, 10_500)
+    # First checkpoint: calculated 100,000 new digits -> total 100,500
+    assert callback_records[0] == (100_000, 100_500)
 
-    # Second checkpoint: calculated 10,000 + 100,000 = 110,000 -> total 110,500
-    assert callback_records[1] == (110_000, 110_500)
+    # Second checkpoint: calculated 100,000 + 1,000,000 = 1,100,000 -> total 1,100,500
+    assert callback_records[1] == (1_100_000, 1_100_500)
 
     # Engine persisted all digits to disk up to checkpoint
-    assert engine.get_total_cached_digits() == 110_500
+    assert engine.get_total_cached_digits() == 1_100_500
 
 
 # =====================================================================
@@ -330,11 +330,74 @@ def test_tc11_total_cached_digits_reporting(tmp_path: Path):
 
 
 # =====================================================================
-# TC-12: Chudnovsky Engine Accuracy Verification
+# TC-12: Empirical Time Estimation Scaling
 # =====================================================================
-def test_tc12_chudnovsky_precision():
+def test_tc12_empirical_time_estimation_scaling(tmp_path: Path):
     """
-    TC-12: Verify first 50 digits of computed Pi match the standard
+    TC-12: Verify estimate_chunk_time() returns monotonically increasing estimates
+    as current_total and chunk_delta grow, properly calibrates from recorded metrics,
+    and format_estimated_time() formats human-readable labels correctly.
+    """
+    engine = PiEngine(data_dir=tmp_path, default_seed_digits=1000)
+
+    # Test baseline calibration
+    engine.last_calc_digits = 100_000
+    engine.last_calc_time = 0.10
+
+    # Monotonicity with respect to current_total
+    est_100k_total = engine.estimate_chunk_time(100_000, 100_000)
+    est_500k_total = engine.estimate_chunk_time(500_000, 100_000)
+    est_1m_total = engine.estimate_chunk_time(1_000_000, 100_000)
+    assert est_100k_total < est_500k_total < est_1m_total
+
+    # Monotonicity with respect to chunk_delta
+    est_delta_50k = engine.estimate_chunk_time(100_000, 50_000)
+    est_delta_100k = engine.estimate_chunk_time(100_000, 100_000)
+    est_delta_1m = engine.estimate_chunk_time(100_000, 1_000_000)
+    assert est_delta_50k < est_delta_100k < est_delta_1m
+
+    # Mathematical precision of scaling law: T_est = 0.10 * (200k / 100k)^1.35
+    expected_2x = 0.10 * (2.0 ** 1.35)
+    assert abs(est_100k_total - expected_2x) < 0.001
+
+    # Format helpers
+    assert PiEngine.format_estimated_time(0.04) == "[< 0.1s]"
+    assert PiEngine.format_estimated_time(1.42) == "[~1.4s]"
+    assert PiEngine.format_estimated_time(42.1) == "[~42s]"
+    assert PiEngine.format_estimated_time(90.0) == "[~1.5m]"
+
+
+# =====================================================================
+# TC-13: 60-Second Time-Ceiling Rule
+# =====================================================================
+def test_tc13_60_second_threshold_rule(tmp_path: Path):
+    """
+    TC-13: Verify that should_show_1m_step() returns True when the estimated
+    time for +1,000,000 digits is <= 60.0s, and False when > 60.0s.
+    """
+    engine = PiEngine(data_dir=tmp_path, default_seed_digits=1000)
+
+    # Fast / baseline state: 1M digits estimated at ~1-2 seconds
+    engine.last_calc_digits = 100_000
+    engine.last_calc_time = 0.05
+    assert engine.estimate_chunk_time(100_000, 1_000_000) <= 60.0
+    assert engine.should_show_1m_step(100_000) is True
+
+    # Deep calculation state where 1M would exceed 60.0s
+    engine.last_calc_digits = 100_000
+    engine.last_calc_time = 5.0  # Slow machine / huge base
+    # Target = 20,000,000 + 1,000,000 = 21,000,000 digits -> ratio = 210 -> 210^1.35 * 5.0 >> 60s
+    est_huge = engine.estimate_chunk_time(20_000_000, 1_000_000)
+    assert est_huge > 60.0
+    assert engine.should_show_1m_step(20_000_000) is False
+
+
+# =====================================================================
+# TC-14: Chudnovsky Engine Accuracy Verification
+# =====================================================================
+def test_tc14_chudnovsky_precision():
+    """
+    TC-14: Verify first 50 digits of computed Pi match the standard
     mathematical reference value.
     """
     reference_50 = "14159265358979323846264338327950288419716939937510"
@@ -343,11 +406,11 @@ def test_tc12_chudnovsky_precision():
 
 
 # =====================================================================
-# TC-13: Persistence and Cold Start Reload
+# TC-15: Persistence and Cold Start Reload
 # =====================================================================
-def test_tc13_persistence_and_cold_start(tmp_path: Path):
+def test_tc15_persistence_and_cold_start(tmp_path: Path):
     """
-    TC-13: Verify that computed digits and sorted query indices persist to
+    TC-15: Verify that computed digits and sorted query indices persist to
     disk and are seamlessly reloaded on cold start without recalculation.
     """
     engine1 = PiEngine(data_dir=tmp_path, default_seed_digits=2000)

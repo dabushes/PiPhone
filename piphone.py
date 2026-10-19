@@ -13,9 +13,14 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-# Explicit import for PyInstaller bundling compatibility on Python 3.12+
+# Explicit import for PyInstaller bundling compatibility on Python 3.12+ and C-extensions
 try:
     import _pylong
+except ImportError:
+    pass
+
+try:
+    import gmpy2
 except ImportError:
     pass
 
@@ -31,7 +36,8 @@ ctk.set_default_color_theme("blue")
 class CheckpointModal(ctk.CTkToplevel):
     """
     Modal dialog displayed when an ongoing search calculation exceeds
-    the cached digits and passes a 10,000 / 100,000 checkpoint boundary.
+    the cached digits and passes a 100,000 / 1,000,000 checkpoint boundary.
+    Displays live empirical compute time estimates and enforces the 60-second rule.
     Blocks interaction with the main window until the user selects an action.
     """
 
@@ -40,11 +46,14 @@ class CheckpointModal(ctk.CTkToplevel):
         parent: ctk.CTk,
         new_digits: int,
         total_cached: int,
+        est_100k: float,
+        est_1m: float,
+        show_1m: bool,
         callback: Callable[[str | int], None],
     ):
         super().__init__(parent)
         self.title("Search Checkpoint")
-        self.geometry("380x255")
+        self.geometry("410x290")
         self.resizable(False, False)
         self.callback = callback
         self._action_taken = False
@@ -56,8 +65,8 @@ class CheckpointModal(ctk.CTkToplevel):
         # Center over parent window
         self.update_idletasks()
         try:
-            x = parent.winfo_x() + (parent.winfo_width() // 2) - 190
-            y = parent.winfo_y() + (parent.winfo_height() // 2) - 128
+            x = parent.winfo_x() + (parent.winfo_width() // 2) - 205
+            y = parent.winfo_y() + (parent.winfo_height() // 2) - 145
             self.geometry(f"+{max(0, x)}+{max(0, y)}")
         except Exception:
             pass
@@ -71,41 +80,47 @@ class CheckpointModal(ctk.CTkToplevel):
             f"(Total Pi Digits Cached: {total_cached:,}).\n\n"
             f"Would you like to continue searching?"
         )
+        if not show_1m:
+            msg += "\n\n(Note: +1,000,000 option hidden: estimated time > 60s)"
+
         self.lbl_msg = ctk.CTkLabel(
             self,
             text=msg,
             font=ctk.CTkFont(size=13),
             justify="center",
-            wraplength=340,
+            wraplength=370,
         )
-        self.lbl_msg.pack(padx=20, pady=(18, 12))
+        self.lbl_msg.pack(padx=16, pady=(16, 10))
 
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(fill="x", padx=24, pady=(0, 16))
 
-        # Option 1: Continue (+10,000)
-        self.btn_10k = ctk.CTkButton(
-            btn_frame,
-            text="Continue (+10,000)",
-            fg_color="#2E7D32",
-            hover_color="#1B5E20",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            height=32,
-            command=lambda: self._select_action(10_000),
-        )
-        self.btn_10k.pack(fill="x", pady=3)
-
-        # Option 2: Continue (+100,000)
+        # Option 1: Continue (+100,000) [~X.Xs]
+        fmt_100k = PiEngine.format_estimated_time(est_100k)
         self.btn_100k = ctk.CTkButton(
             btn_frame,
-            text="Continue (+100,000)",
-            fg_color="#0277BD",
-            hover_color="#01579B",
+            text=f"Continue (+100,000) {fmt_100k}",
+            fg_color="#2E7D32",
+            hover_color="#1B5E20",
             font=ctk.CTkFont(size=12, weight="bold"),
             height=32,
             command=lambda: self._select_action(100_000),
         )
         self.btn_100k.pack(fill="x", pady=3)
+
+        # Option 2: Continue (+1,000,000) [~Y.Ys] (conditionally visible per 60s ceiling rule)
+        if show_1m:
+            fmt_1m = PiEngine.format_estimated_time(est_1m)
+            self.btn_1m = ctk.CTkButton(
+                btn_frame,
+                text=f"Continue (+1,000,000) {fmt_1m}",
+                fg_color="#0277BD",
+                hover_color="#01579B",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                height=32,
+                command=lambda: self._select_action(1_000_000),
+            )
+            self.btn_1m.pack(fill="x", pady=3)
 
         # Option 3: Stop Search
         self.btn_stop = ctk.CTkButton(
@@ -617,7 +632,7 @@ class PiPhoneApp(ctk.CTk):
         self.lbl_position.configure(text="Searching decimal expansion of Pi...")
         self.lbl_telemetry.configure(text="Querying index cache...")
 
-        # Spawn worker thread with 10k default stepping
+        # Spawn worker thread with 100k default stepping
         self._search_thread = threading.Thread(
             target=self._search_worker,
             args=(query,),
@@ -635,7 +650,8 @@ class PiPhoneApp(ctk.CTk):
     def _search_worker(self, query: str):
         """
         Background worker thread executing PiEngine search.
-        Supports progress updates and synchronous checkpoint modal pausing.
+        Supports progress updates and synchronous checkpoint modal pausing
+        with empirical compute duration estimates.
         """
         def progress_cb(digits_searched: int, elapsed: float):
             self._msg_queue.put(("progress", (digits_searched, elapsed)))
@@ -645,13 +661,21 @@ class PiPhoneApp(ctk.CTk):
             if self._cancel_event.is_set():
                 return "stop"
 
+            # Compute empirical time estimates for +100k and +1M steps
+            est_100k = self.engine.estimate_chunk_time(total_cached, 100_000)
+            est_1m = self.engine.estimate_chunk_time(total_cached, 1_000_000)
+            show_1m = self.engine.should_show_1m_step(total_cached)
+
             # Create synchronization primitives
             response_event = threading.Event()
             response_holder: dict[str, str | int] = {"action": "stop"}
 
-            # Send checkpoint request to Tkinter GUI thread
+            # Send checkpoint request with estimates to Tkinter GUI thread
             self._msg_queue.put(
-                ("checkpoint", (new_digits, total_cached, response_event, response_holder))
+                (
+                    "checkpoint",
+                    (new_digits, total_cached, est_100k, est_1m, show_1m, response_event, response_holder),
+                )
             )
 
             # Wait synchronously on worker thread until modal button clicked
@@ -660,7 +684,7 @@ class PiPhoneApp(ctk.CTk):
 
         result = self.engine.search(
             query=query,
-            chunk_size=10_000,
+            chunk_size=100_000,
             cancel_event=self._cancel_event,
             progress_callback=progress_cb,
             checkpoint_callback=checkpoint_cb,
@@ -684,8 +708,24 @@ class PiPhoneApp(ctk.CTk):
                         text=f"Calculating Pi... {digits_searched:,} digits searched ({elapsed:.1f}s elapsed)"
                     )
                 elif msg_type == "checkpoint":
-                    new_digits, total_cached, response_event, response_holder = payload
-                    self._show_checkpoint_modal(new_digits, total_cached, response_event, response_holder)
+                    (
+                        new_digits,
+                        total_cached,
+                        est_100k,
+                        est_1m,
+                        show_1m,
+                        response_event,
+                        response_holder,
+                    ) = payload
+                    self._show_checkpoint_modal(
+                        new_digits,
+                        total_cached,
+                        est_100k,
+                        est_1m,
+                        show_1m,
+                        response_event,
+                        response_holder,
+                    )
                 elif msg_type == "found":
                     self._on_search_completed(payload)
                 elif msg_type == "cancelled":
@@ -700,17 +740,28 @@ class PiPhoneApp(ctk.CTk):
         self,
         new_digits: int,
         total_cached: int,
+        est_100k: float,
+        est_1m: float,
+        show_1m: bool,
         response_event: threading.Event,
         response_holder: dict[str, str | int],
     ):
-        """Opens the checkpoint pause modal on the main GUI thread."""
+        """Opens the checkpoint pause modal with empirical time estimates on the GUI thread."""
         def on_action(action: str | int):
             response_holder["action"] = action
             response_event.set()
             if action == "stop":
                 self._refresh_history_tab()
 
-        CheckpointModal(self, new_digits, total_cached, on_action)
+        CheckpointModal(
+            self,
+            new_digits,
+            total_cached,
+            est_100k,
+            est_1m,
+            show_1m,
+            on_action,
+        )
 
     def _on_search_completed(self, result: SearchResult):
         """Updates the dialer UI and history tab when a match is found."""

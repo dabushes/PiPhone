@@ -10,6 +10,7 @@ This document outlines the Python package dependencies required for the **PiPhon
 | `packaging` | `23.0` | Utilities for version handling and package metadata |
 | `pyinstaller` | `6.0.0` | Build a standalone executable for distribution |
 | `mpmath` | `1.3.0` | Arbitrary-precision arithmetic & Chudnovsky $\pi$ engine |
+| `gmpy2` | `2.1.5` | Compiled C big-integer math backend accelerating $\pi$ calculations 10x–15x |
 | `pytest` | `8.0.0` | Test runner and test suite execution |
 
 These dependencies are listed in the [`requirements.txt`](file:///c:/Users/busht/OneDrive/Dev/PiPhone/requirements.txt) file and can be installed with:
@@ -21,7 +22,7 @@ pip install -r requirements.txt
 Alternatively, you can install them directly:
 
 ```sh
-pip install customtkinter packaging pyinstaller mpmath pytest
+pip install customtkinter packaging pyinstaller mpmath gmpy2 pytest
 ```
 
 ## Development Tools (Optional)

@@ -17,12 +17,21 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
+# Explicit import for PyInstaller bundling of C-extensions
+try:
+    import gmpy2
+except ImportError:
+    gmpy2 = None
+
 import mpmath
 
 # Configure mpmath to avoid printing small exponents in scientific notation
 mpmath.mp.pretty = True
 
-DEFAULT_CHUNK_SIZE = 10_000
+# Verify and log active mpmath backend ('gmpy' vs 'python')
+BACKEND_NAME = getattr(mpmath.libmp, "BACKEND", "python")
+
+DEFAULT_CHUNK_SIZE = 100_000
 MAX_QUERY_LENGTH = 10
 
 
@@ -153,6 +162,15 @@ class PiEngine:
         # Sorted list of (prefix_4digit, first_occurrence_1based)
         self.prefix_index: list[tuple[str, int]] = []
 
+        # Empirical calculation benchmark tracking
+        # Baseline calibration: gmpy2 ~0.05s per 100k, pure Python ~0.35s
+        if BACKEND_NAME == "gmpy":
+            self.last_calc_digits: int = 100_000
+            self.last_calc_time: float = 0.05
+        else:
+            self.last_calc_digits: int = 100_000
+            self.last_calc_time: float = 0.35
+
         self._load_state(default_seed_digits)
 
     def _load_state(self, default_seed_digits: int) -> None:
@@ -266,6 +284,61 @@ class PiEngine:
         with self._lock:
             return len(self.digits)
 
+    def estimate_chunk_time(self, current_total: int, chunk_delta: int) -> float:
+        """
+        Estimates the wall-clock compute duration (in seconds) to expand Pi from
+        current_total to (current_total + chunk_delta) digits using the empirical
+        super-linear scaling law:
+            T_est = T_last * ((current_total + chunk_delta) / N_last) ** 1.35
+
+        Args:
+            current_total: Number of decimal digits currently calculated.
+            chunk_delta: Incremental digits to be generated in the next step.
+
+        Returns:
+            float: Estimated execution time in seconds.
+        """
+        if self.last_calc_digits <= 0:
+            return 0.05
+        target = current_total + chunk_delta
+        ratio = max(0.001, target / self.last_calc_digits)
+        return float(self.last_calc_time * (ratio ** 1.35))
+
+    @staticmethod
+    def format_estimated_time(seconds: float) -> str:
+        """
+        Formats an estimated duration in seconds into a clean bracketed label.
+        Examples: '[< 0.1s]', '[~1.4s]', '[~42s]'.
+
+        Args:
+            seconds: Estimated time in seconds.
+
+        Returns:
+            str: Human-readable bracketed label.
+        """
+        if seconds < 0.1:
+            return "[< 0.1s]"
+        elif seconds < 10.0:
+            return f"[~{seconds:.1f}s]"
+        elif seconds < 60.0:
+            return f"[~{round(seconds)}s]"
+        else:
+            mins = seconds / 60.0
+            return f"[~{mins:.1f}m]"
+
+    def should_show_1m_step(self, current_total: int) -> bool:
+        """
+        Evaluates the 60-second time-ceiling rule for +1,000,000 digits.
+
+        Args:
+            current_total: Current count of cached decimal digits.
+
+        Returns:
+            bool: True if estimated compute time is <= 60.0s, False if > 60.0s.
+        """
+        est_1m = self.estimate_chunk_time(current_total, 1_000_000)
+        return est_1m <= 60.0
+
     def search(
         self,
         query: str,
@@ -279,17 +352,17 @@ class PiEngine:
         1. Validates query (1 to 10 digits).
         2. Binary search in sorted query cache (O(log n)).
         3. Scan existing cached digits.
-        4. If not found, iteratively expands Pi by current_step (default chunk_size=10,000),
+        4. If not found, iteratively expands Pi by current_step (default chunk_size=100,000),
            searching each chunk with overlap = len(query) - 1 to handle boundary-straddling matches.
         5. If sequence is not found in a chunk and checkpoint_callback is provided, pauses and
            calls checkpoint_callback(new_digits_total, total_cached_digits):
            - If callback returns 'stop' or None, cleanly halts and returns None.
-           - If callback returns an int > 0 (e.g. 10_000 or 100_000), updates current_step.
+           - If callback returns an int > 0 (e.g. 100_000 or 1_000_000), updates current_step.
         6. Supports cooperative cancellation via cancel_event.
 
         Args:
             query: User-entered digit string (1-10 digits).
-            chunk_size: Initial chunk step size for expansion (default 10,000).
+            chunk_size: Initial chunk step size for expansion (default 100,000).
             cancel_event: Optional threading event to signal cancellation.
             progress_callback: Optional callback(digits_searched, elapsed_seconds).
             checkpoint_callback: Optional callback(new_digits_calculated, total_cached) returning
@@ -356,8 +429,15 @@ class PiEngine:
             current_len = len(self.digits)
             target_len = current_len + current_step
 
-            # Generate new chunk using Chudnovsky algorithm
+            # Generate new chunk using Chudnovsky algorithm with timing calibration
+            t_calc_start = time.perf_counter()
             new_digits = compute_pi_digits(target_len)
+            calc_duration = time.perf_counter() - t_calc_start
+
+            # Calibrate empirical benchmark with real computation metrics
+            self.last_calc_digits = target_len
+            self.last_calc_time = max(0.001, calc_duration)
+
             new_chunk = new_digits[current_len:]
             new_digits_total += len(new_chunk)
 
@@ -413,7 +493,11 @@ class PiEngine:
         """Expands self.digits to at least target_len digits and saves to disk."""
         if len(self.digits) < target_len:
             with self._lock:
+                t_calc_start = time.perf_counter()
                 self.digits = compute_pi_digits(target_len)
+                calc_duration = time.perf_counter() - t_calc_start
+                self.last_calc_digits = target_len
+                self.last_calc_time = max(0.001, calc_duration)
                 with open(self.digits_file, "w", encoding="ascii") as f:
                     f.write(self.digits)
 
