@@ -26,7 +26,13 @@ except ImportError:
 
 import customtkinter as ctk
 
-from pi_engine import PiEngine, SearchResult, format_context, validate_query
+from pi_engine import (
+    CheckpointTierConfig,
+    PiEngine,
+    SearchResult,
+    format_context,
+    validate_query,
+)
 
 # Configure global visual appearance
 ctk.set_appearance_mode("Dark")
@@ -36,8 +42,8 @@ ctk.set_default_color_theme("blue")
 class CheckpointModal(ctk.CTkToplevel):
     """
     Modal dialog displayed when an ongoing search calculation exceeds
-    the cached digits and passes a 100,000 / 1,000,000 checkpoint boundary.
-    Displays live empirical compute time estimates and enforces the 60-second rule.
+    the cached digits and pauses at a checkpoint boundary.
+    Configures buttons dynamically based on the 4-tier escalating schedule.
     Blocks interaction with the main window until the user selects an action.
     """
 
@@ -46,14 +52,12 @@ class CheckpointModal(ctk.CTkToplevel):
         parent: ctk.CTk,
         new_digits: int,
         total_cached: int,
-        est_100k: float,
-        est_1m: float,
-        show_1m: bool,
+        tier_config: CheckpointTierConfig,
         callback: Callable[[str | int], None],
     ):
         super().__init__(parent)
         self.title("Search Checkpoint")
-        self.geometry("410x290")
+        self.geometry("420x310")
         self.resizable(False, False)
         self.callback = callback
         self._action_taken = False
@@ -65,8 +69,8 @@ class CheckpointModal(ctk.CTkToplevel):
         # Center over parent window
         self.update_idletasks()
         try:
-            x = parent.winfo_x() + (parent.winfo_width() // 2) - 205
-            y = parent.winfo_y() + (parent.winfo_height() // 2) - 145
+            x = parent.winfo_x() + (parent.winfo_width() // 2) - 210
+            y = parent.winfo_y() + (parent.winfo_height() // 2) - 155
             self.geometry(f"+{max(0, x)}+{max(0, y)}")
         except Exception:
             pass
@@ -78,49 +82,45 @@ class CheckpointModal(ctk.CTkToplevel):
             f"Match not found yet.\n\n"
             f"Calculated {new_digits:,} new digits\n"
             f"(Total Pi Digits Cached: {total_cached:,}).\n\n"
-            f"Would you like to continue searching?"
+            f"Speed Tier {tier_config.tier} (1M est: {PiEngine.format_estimated_time(tier_config.t_1m)})\n"
+            f"Select next calculation budget:"
         )
-        if not show_1m:
-            msg += "\n\n(Note: +1,000,000 option hidden: estimated time > 60s)"
 
         self.lbl_msg = ctk.CTkLabel(
             self,
             text=msg,
             font=ctk.CTkFont(size=13),
             justify="center",
-            wraplength=370,
+            wraplength=380,
         )
         self.lbl_msg.pack(padx=16, pady=(16, 10))
 
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
         btn_frame.pack(fill="x", padx=24, pady=(0, 16))
 
-        # Option 1: Continue (+100,000) [~X.Xs]
-        fmt_100k = PiEngine.format_estimated_time(est_100k)
-        self.btn_100k = ctk.CTkButton(
+        # Option 1: Configured by Tier
+        self.btn_opt1 = ctk.CTkButton(
             btn_frame,
-            text=f"Continue (+100,000) {fmt_100k}",
+            text=tier_config.option1.label,
             fg_color="#2E7D32",
             hover_color="#1B5E20",
             font=ctk.CTkFont(size=12, weight="bold"),
             height=32,
-            command=lambda: self._select_action(100_000),
+            command=lambda: self._select_action(tier_config.option1.delta_digits),
         )
-        self.btn_100k.pack(fill="x", pady=3)
+        self.btn_opt1.pack(fill="x", pady=3)
 
-        # Option 2: Continue (+1,000,000) [~Y.Ys] (conditionally visible per 60s ceiling rule)
-        if show_1m:
-            fmt_1m = PiEngine.format_estimated_time(est_1m)
-            self.btn_1m = ctk.CTkButton(
-                btn_frame,
-                text=f"Continue (+1,000,000) {fmt_1m}",
-                fg_color="#0277BD",
-                hover_color="#01579B",
-                font=ctk.CTkFont(size=12, weight="bold"),
-                height=32,
-                command=lambda: self._select_action(1_000_000),
-            )
-            self.btn_1m.pack(fill="x", pady=3)
+        # Option 2: Configured by Tier
+        self.btn_opt2 = ctk.CTkButton(
+            btn_frame,
+            text=tier_config.option2.label,
+            fg_color="#0277BD",
+            hover_color="#01579B",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=32,
+            command=lambda: self._select_action(tier_config.option2.delta_digits),
+        )
+        self.btn_opt2.pack(fill="x", pady=3)
 
         # Option 3: Stop Search
         self.btn_stop = ctk.CTkButton(
@@ -651,30 +651,32 @@ class PiPhoneApp(ctk.CTk):
         """
         Background worker thread executing PiEngine search.
         Supports progress updates and synchronous checkpoint modal pausing
-        with empirical compute duration estimates.
+        with the 4-tier escalating schedule.
         """
         def progress_cb(digits_searched: int, elapsed: float):
             self._msg_queue.put(("progress", (digits_searched, elapsed)))
 
-        def checkpoint_cb(new_digits: int, total_cached: int) -> str | int | None:
+        def checkpoint_cb(
+            new_digits: int,
+            total_cached: int,
+            tier_config: Optional[CheckpointTierConfig] = None,
+        ) -> str | int | None:
             # Check if user already clicked Cancel
             if self._cancel_event.is_set():
                 return "stop"
 
-            # Compute empirical time estimates for +100k and +1M steps
-            est_100k = self.engine.estimate_chunk_time(total_cached, 100_000)
-            est_1m = self.engine.estimate_chunk_time(total_cached, 1_000_000)
-            show_1m = self.engine.should_show_1m_step(total_cached)
+            if tier_config is None:
+                tier_config = self.engine.get_checkpoint_tier_config(total_cached)
 
             # Create synchronization primitives
             response_event = threading.Event()
             response_holder: dict[str, str | int] = {"action": "stop"}
 
-            # Send checkpoint request with estimates to Tkinter GUI thread
+            # Send checkpoint request with tier_config to Tkinter GUI thread
             self._msg_queue.put(
                 (
                     "checkpoint",
-                    (new_digits, total_cached, est_100k, est_1m, show_1m, response_event, response_holder),
+                    (new_digits, total_cached, tier_config, response_event, response_holder),
                 )
             )
 
@@ -684,7 +686,6 @@ class PiPhoneApp(ctk.CTk):
 
         result = self.engine.search(
             query=query,
-            chunk_size=100_000,
             cancel_event=self._cancel_event,
             progress_callback=progress_cb,
             checkpoint_callback=checkpoint_cb,
@@ -711,18 +712,14 @@ class PiPhoneApp(ctk.CTk):
                     (
                         new_digits,
                         total_cached,
-                        est_100k,
-                        est_1m,
-                        show_1m,
+                        tier_config,
                         response_event,
                         response_holder,
                     ) = payload
                     self._show_checkpoint_modal(
                         new_digits,
                         total_cached,
-                        est_100k,
-                        est_1m,
-                        show_1m,
+                        tier_config,
                         response_event,
                         response_holder,
                     )
@@ -740,13 +737,11 @@ class PiPhoneApp(ctk.CTk):
         self,
         new_digits: int,
         total_cached: int,
-        est_100k: float,
-        est_1m: float,
-        show_1m: bool,
+        tier_config: CheckpointTierConfig,
         response_event: threading.Event,
         response_holder: dict[str, str | int],
     ):
-        """Opens the checkpoint pause modal with empirical time estimates on the GUI thread."""
+        """Opens the checkpoint pause modal with the 4-tier escalating schedule on the GUI thread."""
         def on_action(action: str | int):
             response_holder["action"] = action
             response_event.set()
@@ -757,9 +752,7 @@ class PiPhoneApp(ctk.CTk):
             self,
             new_digits,
             total_cached,
-            est_100k,
-            est_1m,
-            show_1m,
+            tier_config,
             on_action,
         )
 

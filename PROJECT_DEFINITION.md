@@ -113,16 +113,25 @@ Full keyboard navigation is enabled whenever the **Pi Dialer** tab is active:
 * **`BackSpace`**: Deletes trailing digit (`⌫`).
 * **`Escape` / `Delete`**: Clears entire input field (`CLR`).
 
-### 2.9 Interactive Checkpoint Pause Modal (100k / 1M Stepping & 60s Rule)
-When a search misses the existing cache and calculates new digits, the engine pauses after every **100,000 newly calculated digits** (default step size):
-* **Modal Dialog (`CTkToplevel`)**: Centered over main window, blocking main window interactions (`grab_set()`).
-* **Live Empirical Time Estimates**: Button labels dynamically display estimated wall-clock calculation durations derived from the empirical scaling formula:
-  * **`Continue (+100,000) [~X.Xs]`**
-  * **`Continue (+1,000,000) [~Y.Ys]`** *(conditionally visible)*
-  * **`Stop Search`**: Halts search, saves all computed digits and index entries to disk, updates the History tab banner, and resets UI state.
-* **60-Second Time-Ceiling Rule**:
-  * Before opening the modal, the engine computes $T_{\text{est}}$ for `+1,000,000` digits.
-  * If $T_{\text{est}}(1,000,000) > 60.0\text{s}$, the `Continue (+1,000,000)` button is **automatically hidden**, and a subtle explanatory note is displayed in the modal prompt (`"(Note: +1,000,000 option hidden: estimated time > 60s)"`), preventing runaway calculations.
+### 2.9 Interactive Checkpoint Pause Modal & 4-Tier Escalating Schedule (v1.3)
+When a search misses the existing cache and calculates new digits:
+* **1,000,000-Digit Initial Burst**: If `current_total < 1,000,000` digits, the engine automatically calculates up to 1,000,000 digits in the initial burst before triggering the first checkpoint modal. If `current_total >= 1,000,000`, the initial burst uses Option 1's step size from the active speed tier.
+* **4-Tier Escalating Schedule**: Evaluates $T_{1\text{M}} = \text{estimate\_chunk\_time}(\text{current\_total}, 1\_000\_000)$ to dynamically configure two calculation buttons alongside **Stop Search**:
+  * **Tier 1 ($T_{1\text{M}} < 15\text{s}$)**:
+    * Button 1: **`Continue (+1,000,000) [~X.Xs]`**
+    * Button 2: **`Run ~30s Burst (+X.XM digits)`**
+  * **Tier 2 ($15\text{s} \le T_{1\text{M}} < 30\text{s}$)**:
+    * Button 1: **`Continue (+1,000,000) [~XXs]`**
+    * Button 2: **`Run ~60s Burst (+X.XM digits)`**
+  * **Tier 3 ($30\text{s} \le T_{1\text{M}} \le 60\text{s}$)**:
+    * *`+1,000,000` retired*
+    * Button 1: **`Run ~1 Min Burst (+X.XM digits)`**
+    * Button 2: **`Run ~2 Min Burst (+X.XM digits)`**
+  * **Tier 4 ($T_{1\text{M}} > 60\text{s}$)**:
+    * Button 1: **`Run ~2 Min Burst (+X.XM digits)`**
+    * Button 2: **`Run ~5 Min Burst (+X.XM digits)`**
+* **Modal Dialog (`CTkToplevel`)**: Centered over the main window, blocking main window interactions (`grab_set()`).
+* **Stop Search**: Halts search, persists all computed digits and index entries to disk, updates the History tab banner, and resets UI state.
 
 ---
 
@@ -133,26 +142,29 @@ flowchart TD
     A[User Enters Digits 1-10] --> B[Click 'Find in Pi']
     B --> C{Binary Search in Query Cache?}
     C -- Hit --> D[Retrieve 1-Based Position & Return Context]
-    C -- Miss --> E{Check 4-Digit Prefix Index}
-    E -- Prefix Found in Cached Digits --> F[Scan Candidate Offsets in Cached pi_digits.txt]
-    F -- Full Match Found --> G[Record to Query Index using Timsort]
-    F -- No Match in Cache --> H[Launch Background Worker Thread]
-    E -- Prefix Not in Cache --> H
-    H --> I[Chudnovsky Expansion: 100k Digits Chunk]
-    I --> J[Check Overlap with Previous Chunk]
-    J --> K{Sequence Found in New Chunk?}
-    K -- Yes --> L[Append Digits to data/pi_digits.txt]
-    L --> M[Update Sorted Index via Timsort]
-    M --> N[Notify UI via Thread-Safe Queue]
-    K -- No --> O{User Clicked Cancel / Stop?}
-    O -- Yes --> P[Clean Cancellation & Persist Digits]
-    O -- No --> Q{Checkpoint Pause: Modal Action}
-    Q -- '+100,000' --> I
-    Q -- '+1,000,000' --> I
-    Q -- 'Stop' --> P
+    C -- Miss --> E{Check In-Memory Cached Digits}
+    E -- Found in Cache --> F[Record to Query Index using Timsort]
+    F --> D
+    E -- Cache Miss --> G{Current Cached < 1,000,000?}
+    G -- Yes --> H[Initial Burst: Calculate up to 1,000,000 Digits]
+    G -- No --> I[Initial Burst: Step Size from Active Speed Tier]
+    H --> J[Chudnovsky Expansion with Overlap]
+    I --> J
+    J --> K[Check Overlap with Previous Chunk: len query - 1]
+    K --> L{Sequence Found in New Chunk?}
+    L -- Yes --> M[Extend for 4 Following Context Digits if at boundary]
+    M --> N[Update Master Digits & Prefix Index]
+    N --> O[Record to Query Index via Timsort]
+    O --> P[Notify UI via Thread-Safe Queue]
+    L -- No --> Q{User Clicked Cancel / Stop?}
+    Q -- Yes --> R[Clean Cancellation & Persist Digits]
+    Q -- No --> S[Checkpoint Pause: 4-Tier Modal Action]
+    S -- Button 1 Action --> J
+    S -- Button 2 Action --> J
+    S -- 'Stop Search' --> R
 ```
 
-### 3.1 Hardware-Accelerated Pi Calculation Engine (`gmpy2` + `mpmath`)
+### 3.1 Hardware-Accelerated Pi Calculation & Time-Budget Engine (`gmpy2` + `mpmath`)
 The calculation engine uses the Ramanujan-Chudnovsky hypergeometric series:
 
 $$\frac{1}{\pi} = 12 \sum_{k=0}^{\infty} \frac{(-1)^k (6k)! (545140134k + 13591409)}{(3k)! (k!)^3 (640320)^{3k + 3/2}}$$
@@ -161,41 +173,29 @@ $$\frac{1}{\pi} = 12 \sum_{k=0}^{\infty} \frac{(-1)^k (6k)! (545140134k + 135914
   * Leverages compiled C GNU Multiple Precision Arithmetic (GMP/MPFR/MPC) backend via `gmpy2`.
   * `mpmath` automatically detects and binds `mpmath.libmp.BACKEND == 'gmpy'`, delivering **10x–15x higher throughput** than pure Python.
   * Graceful fallback to pure Python `BACKEND == 'python'` if `gmpy2` is not present.
-* **Empirical Time Estimation Engine**:
-  * Calculation time scales super-linearly with total precision $N = \text{current\_total} + \text{chunk\_delta}$.
-  * The engine records the exact duration ($T_{\text{last}}$) and digit count ($N_{\text{last}}$) of recent calculations and computes:
+* **Empirical Time Estimation & Inverse Time-Budget Engine**:
+  * Forward Scaling Law:
     $$T_{\text{est}} = T_{\text{last}} \times \left(\frac{\text{current\_total} + \text{chunk\_delta}}{N_{\text{last}}}\right)^{1.35}$$
-  * Accurately drives human-readable modal button labels (`[< 0.1s]`, `[~1.4s]`, `[~42s]`, `[~1.5m]`).
+  * Inverse Scaling Law (`estimate_digits_for_time`):
+    $$N_{\text{target}} = \text{int}\left(N_{\text{last}} \times \left(\frac{T_{\text{budget}}}{T_{\text{last}}}\right)^{1 / 1.35}\right)$$
+    $$\Delta N = \max\left(100\_000, \text{round}\left(\frac{N_{\text{target}} - \text{current\_total}}{100\_000}\right) \times 100\_000\right)$$
+  * Allows exact time-budgeted burst calculations (30s, 60s, 120s, 300s) across all depth scales.
 
 ### 3.2 Persistent Raw Stream (`data/pi_digits.txt`)
 * **Format**: Plain ASCII text file containing contiguous decimal digits of $\pi$ directly following `3.`.
   * Index offset 0 in the file corresponds to 1-based decimal digit position 1 (`1` in `14159...`).
-* **Chunked Appending**: Newly computed digits are appended in 100,000-digit blocks.
-* **Zero Corruption Guarantee**: Writes are flushed and fsynced. On application startup, the file length determines the starting baseline precision.
+* **Chunked Appending**: Newly computed digits are persisted and flushed upon completion of each step.
+* **Zero Corruption Guarantee**: On application startup, the file length determines the starting baseline precision.
 
-### 3.3 Sorted Index & Lookup Engine (`data/pi_index.json`)
-The application maintains two internal lookup tables:
-1. **Query Cache**: A sorted list of `[digit_sequence, first_occurrence_1_based_index]` tuples for every previously resolved user query.
-2. **Prefix Index**: A sorted index of 4-digit prefixes mapping to their first known occurrence or candidate offsets in the cached decimal stream.
-
-#### Sorting Algorithm: Timsort
-Whenever new items are added to the query cache or prefix index:
-* Python's native **Timsort** (`list.sort()` / `sorted()`) is executed.
-* Timsort's $O(n)$ best-case on nearly-sorted data ensures high efficiency when merging incremental batches of newly discovered positions.
-
-#### Search Strategy Pipeline
-1. **Stage 1 (Query Cache Lookup - $O(\log n)$)**:
-   * Perform binary search (`bisect.bisect_left`) against the sorted query cache.
-   * If an exact match is present, resolve in $< 1\text{ms}$ with `Source: Sorted Index Cache`.
-2. **Stage 2 (Prefix Index Jump - $O(\log k)$)**:
-   * If the input length $\ge 4$, extract the leading 4-digit prefix.
-   * Binary search the 4-digit prefix index to find candidate starting offsets in the cached `pi_digits.txt` stream.
-   * Scan candidate offsets or scan the cached stream up to its existing length.
-3. **Stage 3 (Chunked Asynchronous Expansion)**:
-   * If the sequence is not present in existing cached digits, spawn a daemon `threading.Thread`.
-   * Expand $\pi$ in discrete chunks of **100,000 digits**.
-   * **Boundary Overlap Guarantee**: When scanning chunk $M$ against chunk $M-1$, inspect a window overlapping by `len(query) - 1` digits from the end of chunk $M-1$. This guarantees sequences straddling chunk boundaries (e.g. index 99,999 to 100,003) are never missed.
-   * Continue until found or cancelled.
+### 3.3 Boundary Stitch Logic, Safety Lookahead & Prefix Indexing
+1. **Boundary Overlap Guarantee**:
+   * Substring search scans starting at 0-based offset `max(0, current_len - (len(query) - 1))`.
+   * Global 1-based position is calculated as `overlap_start + window_idx + 1`. Any sequence straddling chunk boundaries is guaranteed to be detected on its first occurrence.
+2. **End-of-Chunk Lookahead Safety**:
+   * If a match occurs on the terminal digits of a chunk such that fewer than 4 following digits exist (`global_pos - 1 + len(query) + 4 > len(digits)`), the engine automatically triggers `_expand_to_length(needed_len)` so all 4 context digits are immediately available for display.
+3. **Incremental 4-Digit Prefix Indexing**:
+   * Upon each expansion from `old_len` to `len(digits)`, the engine scans `max(0, old_len - 3)` through `len(digits) - 3` to index boundary-straddling 4-digit prefixes without full table recomputation.
+   * Maintains sorted order via Timsort.
 
 ---
 

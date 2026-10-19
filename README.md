@@ -10,10 +10,11 @@
 |---------|-------------|
 | **Pi Dialer Tab** | Keypad (`0–9`, `CLR`, `⌫`), numeric input (1–10 digits with strict 11th-digit block), and full keyboard/numpad shortcuts. |
 | **Hardware-Accelerated Math** | High-throughput Chudnovsky engine powered by `mpmath` and compiled C `gmpy2` (10x–15x speedup). |
+| **1M-Digit Initial Burst** | Searches missing the cache automatically calculate up to 1,000,000 digits in the initial burst before the first checkpoint modal. |
+| **Time-Budget Calculation Engine** | Inverts the empirical scaling law to determine exact digit quantities ($\Delta N$) achievable within target time budgets (30s, 60s, 120s, 300s). |
+| **4-Tier Escalating Checkpoint Schedule** | Dynamically adapts modal buttons according to current compute speed ($T_{1\text{M}}$), transitioning from fixed `+1,000,000` steps to time-budgeted bursts up to 5 minutes. |
+| **Boundary Stitch & Lookahead Safety** | Hardened `len(query) - 1` boundary stitch, incremental 4-digit prefix indexing, and end-of-chunk guard digits ensuring all 4 context digits are always available. |
 | **Visual Match Context** | Distinct font hierarchy (14pt muted vs 28pt bold green accent) with contextual ellipses (`...1234` **`5678`** `9012...`) and Start-of-Pi `3.` padding. |
-| **Interactive Checkpoint Modal** | Pauses every 100,000 newly calculated digits with options for `+100,000` and `+1,000,000` stepping. |
-| **Empirical Time Estimates** | Displays live estimated compute times on modal buttons (`[< 0.1s]`, `[~1.4s]`, `[~42s]`) via super-linear scaling law. |
-| **60-Second Time-Ceiling Rule** | Automatically hides the `+1,000,000` button if its estimated compute duration exceeds 60 seconds to prevent runaway deep searches. |
 | **Sorted Index & Cache** | Two-tiered lookup table maintained via Python's native Timsort and $O(\log n)$ Binary Search (`bisect`) for instant repeated queries. |
 | **Total Cached Digits Banner** | Real-time telemetry banner on Search History tab showing `Total Pi Digits Cached: X,XXX,XXX`. |
 | **Search Cancellation** | Cooperative cancellation via `threading.Event`, allowing deep searches to be cancelled immediately while preserving computed digits. |
