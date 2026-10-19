@@ -69,38 +69,58 @@ The dial pad follows the standard 3x4 layout with repurposed telephony control k
 * **Active Calculating State**: When a search triggers background $\pi$ expansion, the button dynamically transforms into a bold red **Cancel** button (`fg_color="#C62828"`, `hover_color="#B71C1C"`, text `"Cancel Search"`).
   * Clicking **Cancel** signals the background calculation thread via a `threading.Event`, safely halts chunk generation, preserves all computed digits to disk, and resets the UI state.
 
-### 2.5 Visual Result Display & Start-of-Pi Padding
-When a match is found, the target sequence is displayed flanked by its surrounding decimal context:
+### 2.5 Visual Result Display & Contextual Ellipses
+When a match is found, the target sequence is displayed flanked by its surrounding decimal context with clear font size hierarchy and contextual ellipses:
 
 ```
-[ Preceding 4 Digits ]   [ TARGET MATCHED DIGITS ]   [ Following 4 Digits ]
-     (16pt, Muted)              (26pt, Bold Accent)         (16pt, Muted)
+[ ...Preceding 4 Digits ]   [ TARGET MATCHED DIGITS ]   [ Following 4 Digits... ]
+      (14pt, Muted)               (28pt, Bold Accent)          (14pt, Muted)
 ```
 
-#### Exact Start-of-Pi Rule
+#### Exact Start-of-Pi Rule & Ellipsis Formatting
 * Position `1` is defined as the **first digit after the decimal point** (`1` in `3.1415926535...`).
-* When a match occurs within the first 3 decimal positions, fewer than 4 decimal digits exist to the left. The integer part `"3."` is prepended to represent the actual mathematical prefix:
-  * **Position 1** (`1415`): Preceding = `3.`, Target = `1415`, Following = `9265`
-  * **Position 2** (`4159`): Preceding = `3.1`, Target = `4159`, Following = `2653`
-  * **Position 3** (`1592`): Preceding = `3.14`, Target = `1592`, Following = `6535`
-  * **Position 4** (`5926`): Preceding = `3.141`, Target = `5926`, Following = `5358`
-  * **Position 5+** (`9265`): Preceding = `1415`, Target = `9265`, Following = `3589` (Standard 4 preceding digits)
+* **Standard Case (Position >= 5)**: Prepend leading `...` to the 4 preceding digits and append trailing `...` to the 4 following digits:
+  * **Position 5+** (`9265`): Preceding = `...1415`, Target = `9265`, Following = `3589...`
+* **Start-of-Pi Edge Case (Positions 1 through 4)**: When a match occurs within the first 4 decimal digits, the integer part `"3."` is included in the preceding context. Crucially, the **leading `...` is omitted** before `"3."` because nothing precedes the decimal point in $\pi$:
+  * **Position 1** (`1415`): Preceding = `3.`, Target = `1415`, Following = `9265...`
+  * **Position 2** (`4159`): Preceding = `3.1`, Target = `4159`, Following = `2653...`
+  * **Position 3** (`1592`): Preceding = `3.14`, Target = `1592`, Following = `6535...`
+  * **Position 4** (`5926`): Preceding = `3.141`, Target = `5926`, Following = `5358...`
 
 ### 2.6 Live Telemetry & Status Panel
-* **Searching State**: Live real-time counter updated every 100ms:
+* **Searching State**: Live real-time counter updated continuously:
   `"Calculating Pi... 1,400,000 digits searched (2.3s elapsed)"`
 * **Found State**:
   * Position: `"Found at decimal digit #14,892"`
   * Latency & Source:
     * Cache Hit: `"Source: Sorted Index Cache (0.2ms)"`
     * Calculated: `"Source: Calculated 100,000 new digits (1.4s)"`
-* **Cancelled State**: `"Search cancelled by user at 400,000 digits."`
+* **Cancelled State**: `"Search cancelled by user."`
 
-### 2.7 Search History Tab
-A scrollable table (`CTkScrollableFrame`) displaying historical searches:
-* **Columns**: Searched Digits | Found Position | Context Snippet | Latency | Source | Timestamp.
-* **Storage**: Automatically loaded from and persisted to `data/search_history.json`.
-* **Actions**: One-click "Re-view" button to load any past match back into the main dialer display.
+### 2.7 Search History Tab & Total Cached Digits Banner
+* **Total Digits Telemetry Banner**: Prominent cyan card (`#00E5FF`) at the top of the history tab displaying:
+  **`Total Pi Digits Cached: X,XXX,XXX`**
+  Automatically updates when new digits are calculated or when switching to the History tab.
+* **Scrollable History Feed**: A scrollable table (`CTkScrollableFrame`) displaying historical searches:
+  * Columns: Searched Digits | Found Position | Context Snippet | Latency | Source | Timestamp.
+  * Storage: Persisted on disk at `data/search_history.json`.
+  * Actions: One-click "View" button to reload any past match back into the main dialer display.
+
+### 2.8 Keyboard & Numpad Input Bindings
+Full keyboard navigation is enabled whenever the **Pi Dialer** tab is active:
+* **Numeric Keys `0`–`9` & Numpad**: Appends digit to the dialer input (enforces 10-digit limit and prevents double-entry when `CTkEntry` has focus).
+* **`Return` / `KP_Enter`**: Initiates **Find in Pi** (if input length is 1–10 digits and not searching).
+* **`BackSpace`**: Deletes trailing digit (`⌫`).
+* **`Escape` / `Delete`**: Clears entire input field (`CLR`).
+
+### 2.9 Interactive Checkpoint Pause Modal (10k / 100k Stepping)
+When a search misses the existing cache and calculates new digits, the engine pauses after every **10,000 newly calculated digits** (default step size):
+* **Modal Dialog (`CTkToplevel`)**: Centered over main window, blocking main window interactions (`grab_set()`).
+* **Message**: *"Match not found yet. Calculated X,XXX new digits (Total Pi Digits Cached: Y,YYY,YYY). Would you like to continue searching?"*
+* **Three Actions**:
+  1. **`Continue (+10,000)`**: Calculates next 10,000 digits before pausing again.
+  2. **`Continue (+100,000)`**: Dynamically switches step size to 100,000 digits before pausing again.
+  3. **`Stop Search`**: Halts search, saves all computed digits and index entries to disk, updates the History tab banner, and resets UI state.
 
 ---
 

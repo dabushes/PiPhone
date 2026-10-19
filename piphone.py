@@ -1,5 +1,7 @@
 """
 PiPhone - Interactive Dark-Mode Pi Dialer & Decimal Expansion Search Engine
+Version 1.1: Checkpoint Pausing, Total Digits Banner, Contextual Ellipses,
+and Keyboard/Numpad input bindings.
 """
 
 from __future__ import annotations
@@ -9,7 +11,13 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
+
+# Explicit import for PyInstaller bundling compatibility on Python 3.12+
+try:
+    import _pylong
+except ImportError:
+    pass
 
 import customtkinter as ctk
 
@@ -20,12 +28,119 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
+class CheckpointModal(ctk.CTkToplevel):
+    """
+    Modal dialog displayed when an ongoing search calculation exceeds
+    the cached digits and passes a 10,000 / 100,000 checkpoint boundary.
+    Blocks interaction with the main window until the user selects an action.
+    """
+
+    def __init__(
+        self,
+        parent: ctk.CTk,
+        new_digits: int,
+        total_cached: int,
+        callback: Callable[[str | int], None],
+    ):
+        super().__init__(parent)
+        self.title("Search Checkpoint")
+        self.geometry("380x255")
+        self.resizable(False, False)
+        self.callback = callback
+        self._action_taken = False
+
+        # Make modal window blocking
+        self.transient(parent)
+        self.grab_set()
+
+        # Center over parent window
+        self.update_idletasks()
+        try:
+            x = parent.winfo_x() + (parent.winfo_width() // 2) - 190
+            y = parent.winfo_y() + (parent.winfo_height() // 2) - 128
+            self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Telemetry & prompt description
+        msg = (
+            f"Match not found yet.\n\n"
+            f"Calculated {new_digits:,} new digits\n"
+            f"(Total Pi Digits Cached: {total_cached:,}).\n\n"
+            f"Would you like to continue searching?"
+        )
+        self.lbl_msg = ctk.CTkLabel(
+            self,
+            text=msg,
+            font=ctk.CTkFont(size=13),
+            justify="center",
+            wraplength=340,
+        )
+        self.lbl_msg.pack(padx=20, pady=(18, 12))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=24, pady=(0, 16))
+
+        # Option 1: Continue (+10,000)
+        self.btn_10k = ctk.CTkButton(
+            btn_frame,
+            text="Continue (+10,000)",
+            fg_color="#2E7D32",
+            hover_color="#1B5E20",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=32,
+            command=lambda: self._select_action(10_000),
+        )
+        self.btn_10k.pack(fill="x", pady=3)
+
+        # Option 2: Continue (+100,000)
+        self.btn_100k = ctk.CTkButton(
+            btn_frame,
+            text="Continue (+100,000)",
+            fg_color="#0277BD",
+            hover_color="#01579B",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=32,
+            command=lambda: self._select_action(100_000),
+        )
+        self.btn_100k.pack(fill="x", pady=3)
+
+        # Option 3: Stop Search
+        self.btn_stop = ctk.CTkButton(
+            btn_frame,
+            text="Stop Search",
+            fg_color="#C62828",
+            hover_color="#B71C1C",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            height=32,
+            command=lambda: self._select_action("stop"),
+        )
+        self.btn_stop.pack(fill="x", pady=3)
+
+    def _select_action(self, action: str | int):
+        """Releases grab, destroys modal, and invokes the synchronization callback."""
+        if not self._action_taken:
+            self._action_taken = True
+            try:
+                self.grab_release()
+            except Exception:
+                pass
+            self.destroy()
+            self.callback(action)
+
+    def _on_close(self):
+        """Treat closing modal with 'X' as stopping search."""
+        self._select_action("stop")
+
+
 class PiPhoneApp(ctk.CTk):
     """
     Main PiPhone application window.
     Features a 2-tab interface:
       1. Pi Dialer: Keypad, live search telemetry, and visual match context.
-      2. Search History: Persisted log of historical searches and results.
+      2. Search History: Persisted log of historical searches and total digits banner.
     """
 
     def __init__(self):
@@ -33,7 +148,7 @@ class PiPhoneApp(ctk.CTk):
 
         # Window configuration
         self.title("PiPhone")
-        self.geometry("440x720")
+        self.geometry("440x730")
         self.minsize(400, 680)
 
         # Core engine & concurrency
@@ -50,8 +165,8 @@ class PiPhoneApp(ctk.CTk):
         # Header status bar
         self._build_header()
 
-        # Tabview navigation container (Dialer & Search History only)
-        self.tabs = ctk.CTkTabview(self, corner_radius=8)
+        # Tabview navigation container (Dialer & Search History)
+        self.tabs = ctk.CTkTabview(self, corner_radius=8, command=self._on_tab_changed)
         self.tabs.grid(row=1, column=0, padx=16, pady=(0, 16), sticky="nsew")
 
         self.tab_dialer = self.tabs.add("Pi Dialer")
@@ -59,6 +174,9 @@ class PiPhoneApp(ctk.CTk):
 
         self._build_dialer_tab()
         self._build_history_tab()
+
+        # Bind keyboard & numpad input shortcuts
+        self.bind("<Key>", self._on_key_press)
 
         # Start background UI polling
         self._poll_queue()
@@ -75,7 +193,7 @@ class PiPhoneApp(ctk.CTk):
         self.lbl_title = ctk.CTkLabel(
             self.header_frame,
             text="PIPHONE",
-            font=ctk.CTkFont(size=20, weight="bold")
+            font=ctk.CTkFont(size=20, weight="bold"),
         )
         self.lbl_title.grid(row=0, column=0, sticky="w")
 
@@ -83,7 +201,7 @@ class PiPhoneApp(ctk.CTk):
             self.header_frame,
             text="● Ready",
             text_color="#4CAF50",
-            font=ctk.CTkFont(size=12, weight="bold")
+            font=ctk.CTkFont(size=12, weight="bold"),
         )
         self.lbl_status.grid(row=0, column=1, sticky="e")
 
@@ -104,11 +222,10 @@ class PiPhoneApp(ctk.CTk):
             font=ctk.CTkFont(size=24, weight="bold"),
             height=48,
             validate="key",
-            validatecommand=vcmd
+            validatecommand=vcmd,
         )
         self.number_entry.grid(row=0, column=0, columnspan=3, padx=12, pady=(10, 12), sticky="ew")
         self.number_entry.bind("<KeyRelease>", lambda e: self._update_action_button_state())
-        self.number_entry.bind("<Return>", lambda e: self._on_primary_action())
 
         # Dial pad layout (CLR at bottom-left, ⌫ at bottom-right)
         keypad_buttons = [
@@ -138,7 +255,7 @@ class PiPhoneApp(ctk.CTk):
                 font=ctk.CTkFont(size=18, weight="bold"),
                 fg_color=fg,
                 hover_color=hover,
-                command=cmd
+                command=cmd,
             )
             btn.grid(row=r, column=c, padx=5, pady=5, sticky="nsew")
 
@@ -151,7 +268,7 @@ class PiPhoneApp(ctk.CTk):
             font=ctk.CTkFont(size=16, weight="bold"),
             height=44,
             command=self._on_primary_action,
-            state="disabled"
+            state="disabled",
         )
         self.btn_action.grid(row=5, column=0, columnspan=3, padx=10, pady=(12, 8), sticky="ew")
 
@@ -160,31 +277,34 @@ class PiPhoneApp(ctk.CTk):
         self.result_frame.grid(row=6, column=0, columnspan=3, padx=10, pady=(4, 10), sticky="ew")
         self.result_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
-        # Context labels (preceding, target, following)
+        # Context labels with strict font hierarchy (14pt muted vs 28pt bold accent)
         context_container = ctk.CTkFrame(self.result_frame, fg_color="transparent")
         context_container.grid(row=0, column=0, columnspan=3, pady=(10, 4), padx=8)
 
+        # Preceding 4 digits: Smaller, muted font (14pt gray)
         self.lbl_preceding = ctk.CTkLabel(
             context_container,
             text="",
             text_color="gray60",
-            font=ctk.CTkFont(size=16)
+            font=ctk.CTkFont(size=14),
         )
         self.lbl_preceding.pack(side="left", padx=4)
 
+        # Target matched digits: Large, bold bright accent font (28pt bold)
         self.lbl_target = ctk.CTkLabel(
             context_container,
             text="—",
             text_color="#4CAF50",
-            font=ctk.CTkFont(size=26, weight="bold")
+            font=ctk.CTkFont(size=28, weight="bold"),
         )
         self.lbl_target.pack(side="left", padx=6)
 
+        # Following 4 digits: Smaller, muted font (14pt gray)
         self.lbl_following = ctk.CTkLabel(
             context_container,
             text="",
             text_color="gray60",
-            font=ctk.CTkFont(size=16)
+            font=ctk.CTkFont(size=14),
         )
         self.lbl_following.pack(side="left", padx=4)
 
@@ -193,7 +313,7 @@ class PiPhoneApp(ctk.CTk):
             self.result_frame,
             text="Enter a number and tap 'Find in Pi'",
             text_color="gray70",
-            font=ctk.CTkFont(size=13, weight="bold")
+            font=ctk.CTkFont(size=13, weight="bold"),
         )
         self.lbl_position.grid(row=1, column=0, columnspan=3, pady=(2, 2))
 
@@ -201,7 +321,7 @@ class PiPhoneApp(ctk.CTk):
             self.result_frame,
             text="",
             text_color="gray50",
-            font=ctk.CTkFont(size=11)
+            font=ctk.CTkFont(size=11),
         )
         self.lbl_telemetry.grid(row=2, column=0, columnspan=3, pady=(0, 8))
 
@@ -209,18 +329,42 @@ class PiPhoneApp(ctk.CTk):
     # Tab 2: Search History
     # =========================================================================
     def _build_history_tab(self):
-        """Builds the search history list with persisted historical queries."""
+        """Builds the search history list with total cached digits banner."""
         self.tab_history.grid_columnconfigure(0, weight=1)
-        self.tab_history.grid_rowconfigure(0, weight=1)
+        self.tab_history.grid_rowconfigure(0, weight=0)
+        self.tab_history.grid_rowconfigure(1, weight=1)
 
+        # Feature 1: Prominent banner card displaying total cached digits
+        self.banner_card = ctk.CTkFrame(self.tab_history, fg_color="#1E1E1E", corner_radius=8)
+        self.banner_card.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 4))
+
+        self.lbl_cached_banner = ctk.CTkLabel(
+            self.banner_card,
+            text=f"Total Pi Digits Cached: {self.engine.get_total_cached_digits():,}",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            text_color="#00E5FF",
+        )
+        self.lbl_cached_banner.pack(padx=12, pady=10)
+
+        # Scrollable log of searches
         self.history_list = ctk.CTkScrollableFrame(self.tab_history)
-        self.history_list.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self.history_list.grid(row=1, column=0, sticky="nsew", padx=6, pady=(4, 6))
         self.history_list.grid_columnconfigure(0, weight=1)
 
         self._refresh_history_tab()
 
+    def _on_tab_changed(self):
+        """Refreshes history list and total digits banner when switching tabs."""
+        if self.tabs.get() == "Search History":
+            self._refresh_history_tab()
+
     def _refresh_history_tab(self):
-        """Loads search history log from disk and populates the scrollable frame."""
+        """Updates total cached digits counter and reloads history log from disk."""
+        # Update total cached digits banner
+        total_digits = self.engine.get_total_cached_digits()
+        self.lbl_cached_banner.configure(text=f"Total Pi Digits Cached: {total_digits:,}")
+
+        # Clear existing items
         for widget in self.history_list.winfo_children():
             widget.destroy()
 
@@ -238,7 +382,7 @@ class PiPhoneApp(ctk.CTk):
                 self.history_list,
                 text="No searches recorded yet.",
                 text_color="gray50",
-                font=ctk.CTkFont(size=13)
+                font=ctk.CTkFont(size=13),
             )
             lbl_empty.pack(pady=30)
             return
@@ -264,7 +408,7 @@ class PiPhoneApp(ctk.CTk):
                 card,
                 text=title_text,
                 font=ctk.CTkFont(size=14, weight="bold"),
-                text_color="#E0E0E0"
+                text_color="#E0E0E0",
             )
             lbl_title.grid(row=0, column=0, sticky="w", padx=10, pady=(6, 0))
 
@@ -274,7 +418,7 @@ class PiPhoneApp(ctk.CTk):
                 card,
                 text=context_text,
                 text_color="#4CAF50",
-                font=ctk.CTkFont(size=12)
+                font=ctk.CTkFont(size=12),
             )
             lbl_context.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 2))
 
@@ -284,7 +428,7 @@ class PiPhoneApp(ctk.CTk):
                 card,
                 text=sub_info,
                 text_color="gray60",
-                font=ctk.CTkFont(size=11)
+                font=ctk.CTkFont(size=11),
             )
             lbl_sub.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 6))
 
@@ -299,11 +443,20 @@ class PiPhoneApp(ctk.CTk):
                 font=ctk.CTkFont(size=11, weight="bold"),
                 command=lambda q=query, p=pos, pr=pre, t=tgt, f=flw, s=source, e=elapsed: self._load_history_result(
                     q, p, pr, t, f, s, e
-                )
+                ),
             )
             btn_view.grid(row=0, column=1, rowspan=3, padx=10, pady=6, sticky="e")
 
-    def _load_history_result(self, query: str, pos: int, pre: str, target: str, flw: str, source: str, elapsed: float):
+    def _load_history_result(
+        self,
+        query: str,
+        pos: int,
+        pre: str,
+        target: str,
+        flw: str,
+        source: str,
+        elapsed: float,
+    ):
         """Loads a past search result into the Pi Dialer tab."""
         self.number_entry.delete(0, "end")
         self.number_entry.insert(0, query)
@@ -319,7 +472,7 @@ class PiPhoneApp(ctk.CTk):
         self.tabs.set("Pi Dialer")
 
     # =========================================================================
-    # Input Validation & Keypad Handlers
+    # Input Validation & Keypad / Keyboard Handlers
     # =========================================================================
     def _validate_input_change(self, new_val: str) -> bool:
         """Enforces that input only contains digits and never exceeds 10 digits."""
@@ -372,8 +525,67 @@ class PiPhoneApp(ctk.CTk):
         self.lbl_telemetry.configure(text="")
         self.lbl_status.configure(text="● Ready", text_color="#4CAF50")
 
+    def _on_key_press(self, event):
+        """
+        Global keyboard & numpad event handler for the Pi Dialer tab:
+        - 0-9 (top-row & numpad): appends digit (avoids double entry when entry is focused)
+        - Return / KP_Enter: triggers Find in Pi
+        - BackSpace: deletes trailing digit
+        - Escape / Delete: clears entire input (CLR)
+        """
+        # Only active on the Pi Dialer tab
+        if self.tabs.get() != "Pi Dialer":
+            return
+
+        is_entry_focused = False
+        try:
+            focused = self.focus_get()
+            is_entry_focused = focused in (
+                self.number_entry,
+                getattr(self.number_entry, "_entry", None),
+            )
+        except Exception:
+            pass
+
+        keysym = event.keysym
+
+        # Return / Enter -> Find in Pi
+        if keysym in ("Return", "KP_Enter"):
+            if not self._is_searching:
+                self._on_primary_action()
+            return "break"
+
+        # Escape / Delete -> CLR (Clear input)
+        if keysym in ("Escape", "Delete"):
+            self._clear_input()
+            return "break"
+
+        # BackSpace -> ⌫
+        if keysym == "BackSpace":
+            if not is_entry_focused:
+                self._backspace_digit()
+                return "break"
+            else:
+                self.after(10, self._update_action_button_state)
+                return
+
+        # Numeric digits 0-9 (top row or numpad)
+        digit = None
+        if keysym in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"):
+            digit = keysym
+        elif keysym.startswith("KP_") and len(keysym) == 4 and keysym[3].isdigit():
+            digit = keysym[3]
+
+        if digit is not None:
+            if not is_entry_focused:
+                self._append_digit(digit)
+                return "break"
+            else:
+                self.after(10, self._update_action_button_state)
+                return
+
     # =========================================================================
-    # Search Execution & Concurrency
+    # Search Execution, Concurrency & Checkpoint Pausing
     # =========================================================================
     def _on_primary_action(self):
         """Handles click on the primary action button (Find in Pi or Cancel)."""
@@ -396,7 +608,7 @@ class PiPhoneApp(ctk.CTk):
             text="Cancel Search",
             fg_color="#C62828",
             hover_color="#B71C1C",
-            state="normal"
+            state="normal",
         )
         self.lbl_status.configure(text="● Searching...", text_color="#FFA000")
         self.lbl_preceding.configure(text="")
@@ -405,11 +617,11 @@ class PiPhoneApp(ctk.CTk):
         self.lbl_position.configure(text="Searching decimal expansion of Pi...")
         self.lbl_telemetry.configure(text="Querying index cache...")
 
-        # Spawn worker thread
+        # Spawn worker thread with 10k default stepping
         self._search_thread = threading.Thread(
             target=self._search_worker,
             args=(query,),
-            daemon=True
+            daemon=True,
         )
         self._search_thread.start()
 
@@ -421,14 +633,37 @@ class PiPhoneApp(ctk.CTk):
         self.lbl_position.configure(text="Halting search...")
 
     def _search_worker(self, query: str):
-        """Background calculation thread executing PiEngine search."""
+        """
+        Background worker thread executing PiEngine search.
+        Supports progress updates and synchronous checkpoint modal pausing.
+        """
         def progress_cb(digits_searched: int, elapsed: float):
             self._msg_queue.put(("progress", (digits_searched, elapsed)))
 
+        def checkpoint_cb(new_digits: int, total_cached: int) -> str | int | None:
+            # Check if user already clicked Cancel
+            if self._cancel_event.is_set():
+                return "stop"
+
+            # Create synchronization primitives
+            response_event = threading.Event()
+            response_holder: dict[str, str | int] = {"action": "stop"}
+
+            # Send checkpoint request to Tkinter GUI thread
+            self._msg_queue.put(
+                ("checkpoint", (new_digits, total_cached, response_event, response_holder))
+            )
+
+            # Wait synchronously on worker thread until modal button clicked
+            response_event.wait()
+            return response_holder["action"]
+
         result = self.engine.search(
             query=query,
+            chunk_size=10_000,
             cancel_event=self._cancel_event,
-            progress_callback=progress_cb
+            progress_callback=progress_cb,
+            checkpoint_callback=checkpoint_cb,
         )
 
         if self._cancel_event.is_set() or result is None:
@@ -438,7 +673,7 @@ class PiPhoneApp(ctk.CTk):
             self._msg_queue.put(("found", result))
 
     def _poll_queue(self):
-        """Polls the inter-thread message queue for UI updates."""
+        """Polls the inter-thread message queue for UI events and modal triggers."""
         try:
             while True:
                 msg_type, payload = self._msg_queue.get_nowait()
@@ -448,6 +683,9 @@ class PiPhoneApp(ctk.CTk):
                     self.lbl_telemetry.configure(
                         text=f"Calculating Pi... {digits_searched:,} digits searched ({elapsed:.1f}s elapsed)"
                     )
+                elif msg_type == "checkpoint":
+                    new_digits, total_cached, response_event, response_holder = payload
+                    self._show_checkpoint_modal(new_digits, total_cached, response_event, response_holder)
                 elif msg_type == "found":
                     self._on_search_completed(payload)
                 elif msg_type == "cancelled":
@@ -458,13 +696,29 @@ class PiPhoneApp(ctk.CTk):
         # Schedule next poll in 50ms
         self.after(50, self._poll_queue)
 
+    def _show_checkpoint_modal(
+        self,
+        new_digits: int,
+        total_cached: int,
+        response_event: threading.Event,
+        response_holder: dict[str, str | int],
+    ):
+        """Opens the checkpoint pause modal on the main GUI thread."""
+        def on_action(action: str | int):
+            response_holder["action"] = action
+            response_event.set()
+            if action == "stop":
+                self._refresh_history_tab()
+
+        CheckpointModal(self, new_digits, total_cached, on_action)
+
     def _on_search_completed(self, result: SearchResult):
-        """Updates the dialer UI when a match is found."""
+        """Updates the dialer UI and history tab when a match is found."""
         self._is_searching = False
         self.btn_action.configure(
             text="Find in Pi",
             fg_color="#2E7D32",
-            hover_color="#1B5E20"
+            hover_color="#1B5E20",
         )
         self._update_action_button_state()
 
@@ -481,22 +735,26 @@ class PiPhoneApp(ctk.CTk):
             source_desc = f"Source: {result.source} ({result.elapsed_seconds * 1000:.1f}ms)"
         self.lbl_telemetry.configure(text=source_desc)
 
-        # Refresh history tab content
+        # Refresh history tab content & total digits banner
         self._refresh_history_tab()
 
     def _on_search_cancelled(self):
-        """Resets the dialer UI when calculation is cancelled by the user."""
+        """Resets the dialer UI and updates cached count when calculation halts."""
         self._is_searching = False
         self.btn_action.configure(
             text="Find in Pi",
             fg_color="#2E7D32",
-            hover_color="#1B5E20"
+            hover_color="#1B5E20",
         )
         self._update_action_button_state()
 
-        self.lbl_status.configure(text="● Cancelled", text_color="#FF9800")
-        self.lbl_position.configure(text="Search cancelled by user.")
-        self.lbl_telemetry.configure(text=f"Current cached Pi length: {len(self.engine.digits):,} digits")
+        self.lbl_status.configure(text="● Ready", text_color="#4CAF50")
+        self.lbl_position.configure(text="Search stopped.")
+        total_digits = self.engine.get_total_cached_digits()
+        self.lbl_telemetry.configure(text=f"Total Pi Digits Cached: {total_digits:,}")
+
+        # Refresh history banner
+        self._refresh_history_tab()
 
 
 def main():

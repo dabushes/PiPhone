@@ -8,13 +8,14 @@
 
 | Feature | Description |
 |---------|-------------|
-| **Pi Dialer Tab** | Keypad (`0–9`, `CLR`, `⌫`), numeric input (1–10 digits with strict 11th-digit block), and prominent action controls. |
+| **Pi Dialer Tab** | Keypad (`0–9`, `CLR`, `⌫`), numeric input (1–10 digits with strict 11th-digit block), and full keyboard/numpad shortcuts. |
 | **Search in Pi** | Locates user-entered digit sequences in $\pi$ using a fast Chudnovsky algorithm engine (`mpmath`). |
-| **Visual Match Context** | Flanking display with 4 preceding digits (or `3.` start-of-$\pi$ padding), highlighted target sequence, and 4 following digits. |
+| **Visual Match Context** | Distinct font hierarchy (14pt muted vs 28pt bold green accent) with contextual ellipses (`...1234` **`5678`** `9012...`) and Start-of-Pi `3.` padding. |
+| **Interactive Checkpoint Modal** | Pauses every 10,000 newly calculated digits with options to Continue (+10k), Continue (+100k), or Stop Search. |
 | **Sorted Index & Cache** | Two-tiered lookup table maintained via Python's native Timsort and $O(\log n)$ Binary Search (`bisect`) for instant repeated queries. |
-| **Background Expansion** | Dynamically expands $\pi$ in 100,000-digit background chunks with boundary overlap detection and live telemetry. |
+| **Total Cached Digits Banner** | Real-time telemetry banner on Search History tab showing `Total Pi Digits Cached: X,XXX,XXX`. |
 | **Search Cancellation** | Cooperative cancellation via `threading.Event`, allowing deep searches to be cancelled immediately while preserving computed digits. |
-| **Search History Tab** | Persistent scrollable log of all queries, match positions, context snippets, and execution sources. |
+| **Search History Tab** | Persistent scrollable log of all queries, match positions, context snippets, and execution sources with one-click review. |
 
 ---
 

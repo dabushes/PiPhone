@@ -22,7 +22,7 @@ import mpmath
 # Configure mpmath to avoid printing small exponents in scientific notation
 mpmath.mp.pretty = True
 
-DEFAULT_CHUNK_SIZE = 100_000
+DEFAULT_CHUNK_SIZE = 10_000
 MAX_QUERY_LENGTH = 10
 
 
@@ -54,31 +54,47 @@ def validate_query(query: str) -> str:
     return cleaned
 
 
-def format_context(digits: str, pos_1based: int, query_len: int) -> Tuple[str, str, str]:
+def format_context(
+    digits: str,
+    pos_1based: int,
+    query_len: int,
+    include_ellipses: bool = True,
+) -> Tuple[str, str, str]:
     """
     Formats the context around a matched digit sequence according to the Start-of-Pi rule:
     - pos_1based is 1 for the first decimal digit (e.g. '1' in 3.1415...)
-    - If pos_1based <= 4, prepend '3.' and the preceding decimal digits (if any).
-    - If pos_1based >= 5, take the exact 4 preceding decimal digits.
-    - Following context is the next 4 decimal digits.
+    - If pos_1based <= 4 (e.g. pos 1, 2, 3, or 4), prepends '3.' and the preceding decimal digits.
+      Crucially, the leading ellipsis ('...') is omitted because nothing precedes '3.'.
+    - If pos_1based >= 5, extracts the exact 4 preceding digits and prepends '...'.
+    - Following context extracts the next 4 decimal digits and appends '...'.
 
-    Returns: (preceding, target, following)
+    Args:
+        digits: String of contiguous decimal digits of Pi (excluding '3.').
+        pos_1based: 1-based decimal starting position.
+        query_len: Length of the matched target sequence.
+        include_ellipses: Whether to include leading/trailing '...' contextual markers.
+
+    Returns:
+        Tuple of (preceding, target, following)
     """
     if pos_1based < 1:
         raise ValueError("pos_1based must be >= 1")
-    
+
     idx = pos_1based - 1  # 0-based index in the decimal stream
     target = digits[idx : idx + query_len]
 
     # Preceding context calculation
     if idx < 4:
-        preceding_decimal = digits[:idx]
-        preceding = "3." + preceding_decimal
+        # Start-of-Pi edge case (positions 1 through 4):
+        # Includes '3.' prefix without leading ellipses since '3.' is the start of Pi.
+        preceding = "3." + digits[:idx]
     else:
-        preceding = digits[idx - 4 : idx]
+        raw_pre = digits[idx - 4 : idx]
+        preceding = f"...{raw_pre}" if include_ellipses else raw_pre
 
-    # Following context calculation
-    following = digits[idx + query_len : idx + query_len + 4]
+    # Following context calculation: 4 trailing decimal digits with '...' marker
+    raw_following = digits[idx + query_len : idx + query_len + 4]
+    following = f"{raw_following}..." if include_ellipses else raw_following
 
     return preceding, target, following
 
@@ -239,33 +255,60 @@ class PiEngine:
             return idx + 1
         return None
 
+    def get_total_cached_digits(self) -> int:
+        """
+        Returns the total count of decimal digits of Pi currently calculated
+        and stored in memory/disk.
+
+        Returns:
+            int: Number of decimal digits cached.
+        """
+        with self._lock:
+            return len(self.digits)
+
     def search(
         self,
         query: str,
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         cancel_event: Optional[threading.Event] = None,
         progress_callback: Optional[Callable[[int, float], None]] = None,
+        checkpoint_callback: Optional[Callable[[int, int], str | int | None]] = None,
     ) -> Optional[SearchResult]:
         """
         Executes the search strategy:
         1. Validates query (1 to 10 digits).
         2. Binary search in sorted query cache (O(log n)).
         3. Scan existing cached digits.
-        4. If not found, iteratively expands Pi by chunk_size, searching each chunk
-           with overlap = len(query) - 1 to handle boundary-straddling matches.
-        5. Supports cooperative cancellation via cancel_event.
+        4. If not found, iteratively expands Pi by current_step (default chunk_size=10,000),
+           searching each chunk with overlap = len(query) - 1 to handle boundary-straddling matches.
+        5. If sequence is not found in a chunk and checkpoint_callback is provided, pauses and
+           calls checkpoint_callback(new_digits_total, total_cached_digits):
+           - If callback returns 'stop' or None, cleanly halts and returns None.
+           - If callback returns an int > 0 (e.g. 10_000 or 100_000), updates current_step.
+        6. Supports cooperative cancellation via cancel_event.
+
+        Args:
+            query: User-entered digit string (1-10 digits).
+            chunk_size: Initial chunk step size for expansion (default 10,000).
+            cancel_event: Optional threading event to signal cancellation.
+            progress_callback: Optional callback(digits_searched, elapsed_seconds).
+            checkpoint_callback: Optional callback(new_digits_calculated, total_cached) returning
+                                 new step size (int) or 'stop' / None to halt.
+
+        Returns:
+            SearchResult if found, or None if cancelled or stopped at checkpoint.
         """
         clean_query = validate_query(query)
         start_time = time.perf_counter()
 
-        # Step 1: Binary search query cache
+        # Step 1: Binary search query cache (O(log n))
         cached_pos = self.lookup_cache(clean_query)
         if cached_pos is not None:
             # Verify we have enough trailing digits in self.digits for following context
             needed_len = cached_pos - 1 + len(clean_query) + 4
             if len(self.digits) < needed_len:
                 self._expand_to_length(needed_len)
-            
+
             elapsed = time.perf_counter() - start_time
             preceding, target, following = format_context(self.digits, cached_pos, len(clean_query))
             return SearchResult(
@@ -285,7 +328,7 @@ class PiEngine:
             needed_len = pos_in_cache - 1 + len(clean_query) + 4
             if len(self.digits) < needed_len:
                 self._expand_to_length(needed_len)
-            
+
             self.record_query_match(clean_query, pos_in_cache)
             elapsed = time.perf_counter() - start_time
             preceding, target, following = format_context(self.digits, pos_in_cache, len(clean_query))
@@ -300,19 +343,20 @@ class PiEngine:
                 new_digits_calculated=0,
             )
 
-        # Step 3: Dynamic chunk expansion
+        # Step 3: Dynamic chunk expansion with checkpoint pausing
         q_len = len(clean_query)
         overlap_len = q_len - 1
         new_digits_total = 0
+        current_step = chunk_size
 
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 return None
 
             current_len = len(self.digits)
-            target_len = current_len + chunk_size
+            target_len = current_len + current_step
 
-            # Generate new chunk
+            # Generate new chunk using Chudnovsky algorithm
             new_digits = compute_pi_digits(target_len)
             new_chunk = new_digits[current_len:]
             new_digits_total += len(new_chunk)
@@ -324,7 +368,7 @@ class PiEngine:
 
             window_idx = search_window.find(clean_query)
 
-            # Update master digits
+            # Update master digits and persist to disk
             with self._lock:
                 self.digits = new_digits
                 with open(self.digits_file, "w", encoding="ascii") as f:
@@ -334,7 +378,7 @@ class PiEngine:
                 progress_callback(len(self.digits), time.perf_counter() - start_time)
 
             if window_idx != -1:
-                # Calculate global 1-based position
+                # Match found! Calculate global 1-based position
                 global_pos = (overlap_start + window_idx) + 1
 
                 # Ensure we have 4 following digits for context
@@ -355,6 +399,15 @@ class PiEngine:
                     source=f"Calculated {new_digits_total:,} new digits",
                     new_digits_calculated=new_digits_total,
                 )
+
+            # Checkpoint Pause: Sequence not found yet in this chunk
+            if checkpoint_callback is not None:
+                # Callback triggers interactive modal or test handler
+                action = checkpoint_callback(new_digits_total, len(self.digits))
+                if action == "stop" or action is None:
+                    return None
+                elif isinstance(action, int) and action > 0:
+                    current_step = action
 
     def _expand_to_length(self, target_len: int) -> None:
         """Expands self.digits to at least target_len digits and saves to disk."""

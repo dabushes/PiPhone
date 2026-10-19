@@ -18,29 +18,32 @@ The verification harness uses **`pytest`** (version `>=8.0.0`) organized into mo
 
 | Test ID | Name | Objective | Input / Action | Expected Result |
 | :--- | :--- | :--- | :--- | :--- |
-| **TC-01** | Start-of-Pi Context (`1415`) | Verify position 1 detection and `"3."` preceding padding when no preceding decimal digits exist. | Query = `"1415"` | Pos: `1`<br>Preceding: `"3."`<br>Target: `"1415"`<br>Following: `"9265"` |
-| **TC-02** | Partial `3.` Padding (`4159`) | Verify context padding when only 1 decimal digit precedes target. | Query = `"4159"` | Pos: `2`<br>Preceding: `"3.1"`<br>Target: `"4159"`<br>Following: `"2653"` |
-| **TC-03** | Standard 4-Digit Match & Context (`9265`) | Verify normal 4-digit preceding and following context when $>4$ digits precede target. | Query = `"9265"` | Pos: `5`<br>Preceding: `"1415"`<br>Target: `"9265"`<br>Following: `"3589"` |
+| **TC-01** | Start-of-Pi Context (`1415`) | Verify position 1 detection and `"3."` preceding padding without leading ellipsis. | Query = `"1415"` | Pos: `1`<br>Preceding: `"3."`<br>Target: `"1415"`<br>Following: `"9265..."` |
+| **TC-02** | Partial `3.` Padding (`4159`) | Verify context padding when only 1 decimal digit precedes target without leading ellipsis. | Query = `"4159"` | Pos: `2`<br>Preceding: `"3.1"`<br>Target: `"4159"`<br>Following: `"2653..."` |
+| **TC-03** | Standard 4-Digit Match & Context (`9265`) | Verify normal 4-digit preceding and following context with both leading and trailing ellipses. | Query = `"9265"` | Pos: `5`<br>Preceding: `"...1415"`<br>Target: `"9265"`<br>Following: `"3589..."` |
 | **TC-04** | Input Validation & 11th Digit Block | Verify inputs 1–10 digits accepted, non-digits rejected, 11th digit blocked. | Test valid strings (`"7"`, `"8675309"`, `"1234567890"`), invalid (`"12a"`, `""`, `"-5"`), and 11-digit (`"12345678901"`). | Valid: Accepted.<br>Non-numeric: Rejected.<br>Len > 10: Blocked at 10 chars. |
 | **TC-05** | Timsort & Binary Search Cache Hit | Verify duplicate query resolves via binary search (`bisect`) without generating new $\pi$ chunks. | Search `"9265"` twice; assert calculation count on 2nd query is 0. | 1st query: Calculated/Cached.<br>2nd query: `is_cache_hit = True`, latency $< 2\text{ms}$, 0 new digits generated. |
-| **TC-06** | Chunk Boundary Overlap | Verify sequence straddling the boundary between chunk $N$ and chunk $N+1$ is accurately detected. | Synthesize or compute across chunk boundary (e.g., at digit `100,000`), search sequence spanning digits `99,998` to `100,003`. | Match located at the boundary index without missing digits or duplication. |
-| **TC-07** | Background Thread Cancellation | Verify setting `cancel_event` cleanly halts computation, retains computed digits, and resets UI state. | Launch background search for deep unknown sequence; trigger `cancel_event.set()` after 100ms. | Worker thread exits safely within 500ms; calculated digits up to cancellation point are intact on disk. |
-| **TC-08** | Chudnovsky Mathematical Precision | Verify computed digits against mathematical ground truth constants. | Compute first 1,000 digits of $\pi$. | Decimal sequence matches reference sequence of $\pi$ exactly with 0 discrepant digits. |
-| **TC-09** | Persistent Cache & Cold Start | Verify saving calculated digits and index to disk, re-instantiating engine, and finding sequence. | Compute digits, persist to disk, instantiate new `PiEngine` instance from same directory. | Engine loads cached stream and sorted index immediately on startup without recalculation. |
-| **TC-10** | Single-Digit Edge Case Search | Verify searching single-digit inputs (e.g. `"1"`, `"4"`, `"9"`) locates correct first 1-based decimal position. | Query = `"1"`, Query = `"4"` | `"1"` -> Pos 1, Preceding: `"3."`, Target: `"1"`, Following: `"4159"`<br>`"4"` -> Pos 2, Preceding: `"3.1"`, Target: `"4"`, Following: `"1592"` |
+| **TC-06** | Chunk Boundary Overlap | Verify sequence straddling the boundary between chunk $N$ and chunk $N+1$ is accurately detected. | Synthesize or compute across chunk boundary (e.g., at digit `500`), search sequence spanning digits `497` to `503`. | Match located at the boundary index without missing digits or duplication. |
+| **TC-07** | Background Thread Cancellation | Verify setting `cancel_event` cleanly halts computation, retains computed digits, and resets UI state. | Launch background search for deep unknown sequence; trigger `cancel_event.set()` after 20ms. | Worker thread exits safely within 500ms; calculated digits up to cancellation point are intact on disk. |
+| **TC-08** | Ellipsis Formatting (Standard) | Verify that searching a sequence at position >= 5 formats preceding context with leading `...` and following with trailing `...`. | Query = `"9265"` at Pos 5 | Preceding: `"...1415"`, Target: `"9265"`, Following: `"3589..."` |
+| **TC-09** | Ellipsis Formatting (Start-of-Pi `3.` Edge Case) | Verify that searching sequences at decimal positions 1–4 omits leading `...` before `3.` while retaining trailing `...`. | Query = `"1415"` (Pos 1), `"4159"` (Pos 2), `"1592"` (Pos 3), `"5926"` (Pos 4) | Pos 1: Preceding `"3."`<br>Pos 2: Preceding `"3.1"`<br>Pos 3: Preceding `"3.14"`<br>Pos 4: Preceding `"3.141"`<br>All with trailing `...` and no leading `...`. |
+| **TC-10** | Checkpoint Pause & Resume Callback | Verify engine pauses at 10,000 new digits, can dynamically switch step size to 100,000, and cleanly saves state when stopped. | Search deep query with mock checkpoint callback switching to 100k then stopping. | Engine triggers callbacks at 10k and 110k, halts cleanly, and saves 110.5k digits to disk. |
+| **TC-11** | Total Cached Digits Reporting | Verify engine accurately reports total count of cached decimal digits before and after chunk expansion. | Check `get_total_cached_digits()` before and after `_expand_to_length()`. | Accurate integer count returned matching disk file length across restarts. |
+| **TC-12** | Chudnovsky Mathematical Precision | Verify computed digits against mathematical ground truth constants. | Compute first 50 digits of $\pi$. | Decimal sequence matches reference sequence of $\pi$ exactly with 0 discrepant digits. |
+| **TC-13** | Persistent Cache & Cold Start | Verify saving calculated digits and index to disk, re-instantiating engine, and finding sequence. | Compute digits, persist to disk, instantiate new `PiEngine` instance from same directory. | Engine loads cached stream and sorted index immediately on startup without recalculation. |
 
 ---
 
 ## 3. Detailed Test Specification
 
-### 3.1 Start-of-Pi Context Padding (TC-01, TC-02, TC-03, TC-10)
+### 3.1 Start-of-Pi Context & Ellipsis Rules (TC-01, TC-02, TC-03, TC-08, TC-09)
 Let $P$ be the 1-based decimal position of the target sequence within $\pi = 3.d_1 d_2 d_3 \dots$:
-* For $P = 1$: Preceding context is `"3."`
-* For $P = 2$: Preceding context is `"3." + d_1` (length 3, starting with `"3."`)
-* For $P = 3$: Preceding context is `"3." + d_1 d_2` (length 4, starting with `"3."`)
-* For $P = 4$: Preceding context is `"3." + d_1 d_2 d_3` (length 5, starting with `"3."`)
-* For $P \ge 5$: Preceding context is $d_{P-4} d_{P-3} d_{P-2} d_{P-1}$ (exactly 4 preceding decimal digits).
-* Following context is always the 4 subsequent decimal digits: $d_{P+L} d_{P+L+1} d_{P+L+2} d_{P+L+3}$ where $L = \text{len}(\text{query})$.
+* For $P = 1$: Preceding context is `"3."` (NO leading `...` because nothing precedes `3.`)
+* For $P = 2$: Preceding context is `"3." + d_1` (NO leading `...`)
+* For $P = 3$: Preceding context is `"3." + d_1 d_2` (NO leading `...`)
+* For $P = 4$: Preceding context is `"3." + d_1 d_2 d_3` (NO leading `...`)
+* For $P \ge 5$: Preceding context is `"..." + d_{P-4} d_{P-3} d_{P-2} d_{P-1}` (leading `...` prepended).
+* Following context is always: $d_{P+L} d_{P+L+1} d_{P+L+2} d_{P+L+3} + \text{"..."}$ (trailing `...` appended).
 
 ### 3.2 Input Validation Specification (TC-04)
 The validation logic `validate_query(input_str)` must conform to:
