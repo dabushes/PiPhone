@@ -1,9 +1,10 @@
-venv/
+﻿venv/
+.venv/
 __pycache__/
+.pytest_cache/
 *.pyc
 *.exe
+*.spec
 dist/
 build/
 data/
-.pytest_cache/
-*.spec
