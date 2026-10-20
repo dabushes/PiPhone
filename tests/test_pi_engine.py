@@ -18,6 +18,7 @@ from pi_engine import (
     compute_pi_digits,
     format_context,
     format_delta_digits,
+    get_seed_path,
     validate_query,
 )
 
@@ -381,8 +382,8 @@ def test_tc12_empirical_time_estimation_scaling(tmp_path: Path):
     est_delta_1m = engine.estimate_chunk_time(100_000, 1_000_000)
     assert est_delta_50k < est_delta_100k < est_delta_1m
 
-    # Mathematical precision of scaling law: T_est = 0.10 * (200k / 100k)^1.35
-    expected_2x = 0.10 * (2.0 ** 1.35)
+    # Mathematical precision of scaling law: T_est = 0.10 * (200k / 100k)^1.65
+    expected_2x = 0.10 * (2.0 ** 1.65)
     assert abs(est_100k_total - expected_2x) < 0.001
 
     # Format helpers
@@ -449,71 +450,300 @@ def test_tc14_inverse_time_budget_estimator(tmp_path: Path):
 
 
 # =====================================================================
-# TC-15: 4-Tier Checkpoint Schedule (get_checkpoint_tier_config)
+# TC-15: 5-Tier Checkpoint Schedule (get_checkpoint_tier_config)
 # =====================================================================
-def test_tc15_4_tier_checkpoint_schedule(tmp_path: Path):
+def test_tc15_5_tier_checkpoint_schedule(tmp_path: Path):
     """
-    TC-15: Verify get_checkpoint_tier_config() across all 4 speed tiers:
-    - Tier 1: T_1M < 15s -> Continue (+1,000,000), Run ~30s Burst
-    - Tier 2: 15s <= T_1M < 30s -> Continue (+1,000,000), Run ~60s Burst
-    - Tier 3: 30s <= T_1M <= 60s -> Run ~1 Min Burst, Run ~2 Min Burst (+1M retired)
-    - Tier 4: T_1M > 60s -> Run ~2 Min Burst, Run ~5 Min Burst
+    TC-15: Verify get_checkpoint_tier_config() across all 5 speed tiers:
+    - Tier 1: T_min_step < 15s -> Continue (+1,000,000 Digits) [~X.Xs], Search for 30 Seconds
+    - Tier 2: 15s <= T_min_step < 24s -> Continue (+1,000,000 Digits) [~XXs], Search for 60 Seconds
+    - Tier 3: 24s <= T_min_step < 48s -> Search for 1 Minute, Search for 2 Minutes
+    - Tier 4: 48s <= T_min_step <= 90s -> Search for 2 Minutes, Search for 5 Minutes
+    - Tier 5: T_min_step > 90s -> Calculate Next Block, Search for X Minutes, Note present
     """
     engine = PiEngine(data_dir=tmp_path, default_seed_digits=1000)
 
-    # --- Tier 1 (T_1M < 15s) ---
+    # --- Tier 1 (T_min_step < 15s) ---
     engine.last_calc_digits = 1_000_000
-    engine.last_calc_time = 2.5
-    # current_total = 1_000_000, +1M -> target 2M -> ratio 2 -> 2.5 * 2^1.35 ~ 6.37s (< 15s)
+    engine.last_calc_time = 2.0
+    # current_total = 1_000_000, +2M -> target 3M -> ratio 3 -> 2.0 * 3^1.65 ~ 12.26s (< 15s)
     cfg1 = engine.get_checkpoint_tier_config(1_000_000)
     assert cfg1.tier == 1
-    assert "Continue (+1,000,000)" in cfg1.option1.label
+    assert "Continue (+1,000,000" in cfg1.option1.label
     assert cfg1.option1.delta_digits == 1_000_000
-    assert "Run ~30s Burst" in cfg1.option2.label
+    assert cfg1.option1.mode == "fixed_digits"
+    assert "Search for 30 Seconds" in cfg1.option2.label
     assert cfg1.option2.target_seconds == 30.0
+    assert cfg1.option2.mode == "time_budget"
+    assert cfg1.note == ""
 
-    # --- Tier 2 (15s <= T_1M < 30s) ---
+    # --- Tier 2 (15s <= T_min_step < 24s) ---
     engine.last_calc_digits = 1_000_000
-    engine.last_calc_time = 8.0
-    # current_total = 1_000_000, +1M -> target 2M -> ratio 2 -> 8.0 * 2^1.35 ~ 20.4s
+    engine.last_calc_time = 3.2
+    # current_total = 1_000_000, +2M -> target 3M -> 3.2 * 3^1.65 ~ 19.6s (15 <= t < 24)
     cfg2 = engine.get_checkpoint_tier_config(1_000_000)
     assert cfg2.tier == 2
-    assert "Continue (+1,000,000)" in cfg2.option1.label
+    assert "Continue (+1,000,000" in cfg2.option1.label
     assert cfg2.option1.delta_digits == 1_000_000
-    assert "Run ~60s Burst" in cfg2.option2.label
+    assert cfg2.option1.mode == "fixed_digits"
+    assert "Search for 60 Seconds" in cfg2.option2.label
     assert cfg2.option2.target_seconds == 60.0
+    assert cfg2.option2.mode == "time_budget"
+    assert cfg2.note == ""
 
-    # --- Tier 3 (30s <= T_1M <= 60s) ---
+    # --- Tier 3 (24s <= T_min_step < 48s) ---
     engine.last_calc_digits = 1_000_000
-    engine.last_calc_time = 18.0
-    # current_total = 1_000_000, +1M -> target 2M -> ratio 2 -> 18.0 * 2^1.35 ~ 45.9s
+    engine.last_calc_time = 5.5
+    # current_total = 1_000_000, +2M -> target 3M -> 5.5 * 3^1.65 ~ 33.7s (24 <= t < 48)
     cfg3 = engine.get_checkpoint_tier_config(1_000_000)
     assert cfg3.tier == 3
-    # +1,000,000 button retired
-    assert "Continue (+1,000,000)" not in cfg3.option1.label
-    assert "Run ~1 Min Burst" in cfg3.option1.label
+    assert "Continue (+1,000,000" not in cfg3.option1.label
+    assert "Search for 1 Minute" in cfg3.option1.label
     assert cfg3.option1.target_seconds == 60.0
-    assert "Run ~2 Min Burst" in cfg3.option2.label
+    assert cfg3.option1.mode == "time_budget"
+    assert "Search for 2 Minutes" in cfg3.option2.label
     assert cfg3.option2.target_seconds == 120.0
+    assert cfg3.option2.mode == "time_budget"
+    assert cfg3.note == ""
 
-    # --- Tier 4 (T_1M > 60s) ---
+    # --- Tier 4 (48s <= T_min_step <= 90s) ---
     engine.last_calc_digits = 1_000_000
-    engine.last_calc_time = 35.0
-    # current_total = 1_000_000, +1M -> target 2M -> ratio 2 -> 35.0 * 2^1.35 ~ 89.2s (> 60s)
+    engine.last_calc_time = 11.0
+    # current_total = 1_000_000, +2M -> target 3M -> 11.0 * 3^1.65 ~ 67.4s (48 <= t <= 90)
     cfg4 = engine.get_checkpoint_tier_config(1_000_000)
     assert cfg4.tier == 4
-    assert "Run ~2 Min Burst" in cfg4.option1.label
+    assert "Search for 2 Minutes" in cfg4.option1.label
     assert cfg4.option1.target_seconds == 120.0
-    assert "Run ~5 Min Burst" in cfg4.option2.label
+    assert cfg4.option1.mode == "time_budget"
+    assert "Search for 5 Minutes" in cfg4.option2.label
     assert cfg4.option2.target_seconds == 300.0
+    assert cfg4.option2.mode == "time_budget"
+    assert cfg4.note == ""
+
+    # --- Tier 5 (T_min_step > 90s) ---
+    engine.last_calc_digits = 1_000_000
+    engine.last_calc_time = 20.0
+    # current_total = 1_000_000, +2M -> target 3M -> 20.0 * 3^1.65 ~ 122.6s (> 90s)
+    cfg5 = engine.get_checkpoint_tier_config(1_000_000)
+    assert cfg5.tier == 5
+    assert "Calculate Next Block" in cfg5.option1.label
+    assert "Search for" in cfg5.option2.label
+    assert cfg5.note != ""
+    assert "computing the next block of Pi requires" in cfg5.note
 
 
 # =====================================================================
-# TC-16: Chudnovsky Engine Accuracy Verification
+# TC-16: Multi-Step Cache Invariance Regression Test
 # =====================================================================
-def test_tc16_chudnovsky_precision():
+def test_tc16_multi_step_cache_invariance(tmp_path: Path):
     """
-    TC-16: Verify first 50 digits of computed Pi match the standard
+    TC-16: Verify that computing Pi in 3 separate incremental steps
+    (e.g., 50,000 -> 100,000 -> 150,000 digits) results in an engine.pi_digits
+    stream that is 100% byte-for-byte identical to computing 150,000 digits
+    in a single fresh run. Also verify that sequential searches return
+    identical 1-based decimal positions regardless of whether the cache starts
+    empty or partially populated.
+    """
+    # Incremental engine: 50,000 -> 100,000 -> 150,000
+    inc_dir = tmp_path / "incremental"
+    engine_inc = PiEngine(data_dir=inc_dir, default_seed_digits=50_000)
+    assert len(engine_inc.pi_digits) == 50_000
+
+    engine_inc._expand_to_length(100_000)
+    assert len(engine_inc.pi_digits) == 100_000
+
+    engine_inc._expand_to_length(150_000)
+    assert len(engine_inc.pi_digits) == 150_000
+
+    # Fresh single-step engine: 150,000 directly
+    fresh_dir = tmp_path / "fresh"
+    engine_fresh = PiEngine(data_dir=fresh_dir, default_seed_digits=150_000)
+    assert len(engine_fresh.pi_digits) == 150_000
+
+    # Byte-for-byte stream invariance check
+    assert engine_inc.pi_digits == engine_fresh.pi_digits
+    assert engine_inc.digits == engine_fresh.digits
+
+    # Also verify file contents on disk
+    with open(engine_inc.digits_file, "r", encoding="ascii") as f1, open(
+        engine_fresh.digits_file, "r", encoding="ascii"
+    ) as f2:
+        assert f1.read() == f2.read()
+
+    # Deterministic search comparison across both engines:
+    # Test queries straddling chunk boundaries (e.g. index 50,000 and 100,000)
+    q_boundary_1 = engine_fresh.pi_digits[49_997:50_004]  # straddles 50,000
+    q_boundary_2 = engine_fresh.pi_digits[99_996:100_003]  # straddles 100,000
+
+    res_inc_1 = engine_inc.search(q_boundary_1)
+    res_fresh_1 = engine_fresh.search(q_boundary_1)
+    assert res_inc_1 is not None and res_fresh_1 is not None
+    assert res_inc_1.position == res_fresh_1.position
+
+    res_inc_2 = engine_inc.search(q_boundary_2)
+    res_fresh_2 = engine_fresh.search(q_boundary_2)
+    assert res_inc_2 is not None and res_fresh_2 is not None
+    assert res_inc_2.position == res_fresh_2.position
+
+
+# =====================================================================
+# TC-17: Wall-Clock Time-Budget Loop
+# =====================================================================
+def test_tc17_wall_clock_time_budget_loop(tmp_path: Path):
+    """
+    TC-17: Verify that selecting a time-budget option executes a true wall-clock
+    timer loop across multiple dynamic expansions until the time budget is exhausted
+    (or sequence found / cancelled), updating progress telemetry and recalibrating
+    calculation metrics before prompting the checkpoint callback again.
+    """
+    engine = PiEngine(data_dir=tmp_path, default_seed_digits=10_000)
+    initial_digits = engine.get_total_cached_digits()
+    assert initial_digits == 10_000
+
+    checkpoints: list[tuple[int, int, str]] = []
+    progress_messages: list[str] = []
+    burst_start_time = 0.0
+    burst_elapsed_time = 0.0
+
+    def progress_cb(digits: int, elapsed: float, status_msg: Optional[str] = None):
+        if status_msg:
+            progress_messages.append(status_msg)
+
+    def checkpoint_cb(new_digits: int, total_cached: int, tier_cfg: CheckpointTierConfig):
+        nonlocal burst_start_time, burst_elapsed_time
+        checkpoints.append((new_digits, total_cached, f"checkpoint_{len(checkpoints) + 1}"))
+
+        if len(checkpoints) == 1:
+            # First pause (after initial chunk miss): trigger a 1.5s wall-clock time budget burst
+            burst_start_time = time.perf_counter()
+            return CheckpointOption(
+                label="Search for 1.5 Seconds",
+                mode="time_budget",
+                target_seconds=1.5,
+            )
+        else:
+            # Second pause (after 1.5s burst completes): record elapsed burst time and stop search
+            burst_elapsed_time = time.perf_counter() - burst_start_time
+            return "stop"
+
+    # Search for an unfound 10-digit number
+    res = engine.search(
+        "9999999999",
+        chunk_size=50_000,
+        checkpoint_callback=checkpoint_cb,
+        progress_callback=progress_cb,
+    )
+
+    assert res is None
+    # Checkpoint modal was invoked exactly twice:
+    # 1. After initial chunk miss
+    # 2. After 1.5s wall-clock burst completed
+    assert len(checkpoints) == 2
+
+    # Verify that the wall-clock loop ran for at least ~1.1 seconds (allowing timing jitter)
+    assert burst_elapsed_time >= 1.1
+
+    # Verify that total cached digits grew substantially beyond initial 60,000
+    assert checkpoints[1][1] > checkpoints[0][1]
+
+    # Verify progress callback received formatted time-budget telemetry
+    assert len(progress_messages) >= 1
+    assert any("Running 1.5s Burst" in msg for msg in progress_messages)
+
+    # Verify data persistence
+    assert engine.get_total_cached_digits() == checkpoints[1][1]
+    with open(engine.digits_file, "r", encoding="ascii") as f:
+        assert len(f.read().strip()) == engine.get_total_cached_digits()
+
+
+# =====================================================================
+# TC-18: T_min_step Golden Rule Enforcement
+# =====================================================================
+def test_tc18_t_min_step_golden_rule_enforcement(tmp_path: Path):
+    """
+    TC-18: Verify that across all simulated values of t_min_step
+    (5s, 20s, 35s, 65s, 180s), no returned modal button ever has a time budget
+    smaller than t_min_step (and strictly >= 1.25 * t_min_step), and Tier 5
+    triggers accurately when t_min_step > 90.0s.
+    """
+    engine = PiEngine(data_dir=tmp_path, default_seed_digits=1000)
+    engine.has_calibrated_benchmark = True  # bypass micro-benchmark for simulation
+
+    test_steps = [
+        (5.0, 1),
+        (20.0, 2),
+        (35.0, 3),
+        (65.0, 4),
+        (180.0, 5),
+    ]
+
+    for simulated_t_min_step, expected_tier in test_steps:
+        # At current_total = 1_000_000, target for +2M is 3_000_000 -> ratio = 3.0
+        # t_min_step = t_last * (3.0 ** 1.65)
+        # So t_last = simulated_t_min_step / (3.0 ** 1.65)
+        engine.last_calc_digits = 1_000_000
+        engine.last_calc_time = simulated_t_min_step / (3.0 ** 1.65)
+
+        cfg = engine.get_checkpoint_tier_config(1_000_000)
+        assert cfg.tier == expected_tier
+        assert abs(cfg.t_min_step - simulated_t_min_step) < 0.01
+
+        # Golden Rule Assertion: every time-budget option must have duration >= 1.25 * t_min_step
+        options = [cfg.option1, cfg.option2]
+        for opt in options:
+            if opt.mode == "time_budget":
+                assert opt.target_seconds is not None
+                assert opt.target_seconds >= cfg.t_min_step
+                assert opt.target_seconds >= 1.25 * cfg.t_min_step - 0.01
+
+        if expected_tier == 5:
+            assert cfg.note != ""
+            assert "computing the next block of Pi requires" in cfg.note
+            assert "Calculate Next Block" in cfg.option1.label
+            assert cfg.option1.mode == "fixed_digits"
+            assert cfg.option1.delta_digits == 2_000_000
+
+
+# =====================================================================
+# TC-19: Seed Extraction & Landmark Verification
+# =====================================================================
+def test_tc19_seed_extraction_and_landmarks(tmp_path: Path):
+    """
+    TC-19: Verify seed decompression logic and assert that when the 100M seed
+    is loaded, landmarks 6411415 and 6434099 are resolved instantaneously (< 0.1s)
+    at positions 23,018,978 and 35,047,512 respectively.
+    """
+    seed_path = get_seed_path()
+    assert seed_path is not None, "Bundled 100M seed archive must exist in seed/ directory."
+    assert seed_path.exists()
+
+    # Initialize engine in isolated tmp_path with load_seed_pack=True
+    engine = PiEngine(data_dir=tmp_path, default_seed_digits=0, load_seed_pack=True)
+    assert engine.get_total_cached_digits() == 100_000_000
+
+    # Search for landmark 1: 6411415 -> pos 23,018,978
+    t0 = time.perf_counter()
+    res1 = engine.search("6411415")
+    elapsed1 = time.perf_counter() - t0
+    assert res1 is not None
+    assert res1.position == 23_018_978
+    assert elapsed1 < 0.15  # Instantaneous cache lookup
+
+    # Search for landmark 2: 6434099 -> pos 35,047,512
+    t0 = time.perf_counter()
+    res2 = engine.search("6434099")
+    elapsed2 = time.perf_counter() - t0
+    assert res2 is not None
+    assert res2.position == 35_047_512
+    assert elapsed2 < 0.15  # Instantaneous cache lookup
+
+
+# =====================================================================
+# TC-20: Chudnovsky Engine Accuracy Verification
+# =====================================================================
+def test_tc20_chudnovsky_precision():
+    """
+    TC-20: Verify first 50 digits of computed Pi match the standard
     mathematical reference value.
     """
     reference_50 = "14159265358979323846264338327950288419716939937510"
@@ -522,32 +752,32 @@ def test_tc16_chudnovsky_precision():
 
 
 # =====================================================================
-# TC-17: Persistence and Cold Start Reload
+# TC-21: Persistence and Cold Start Reload
 # =====================================================================
-def test_tc17_persistence_and_cold_start(tmp_path: Path):
+def test_tc21_persistence_and_cold_start(tmp_path: Path):
     """
-    TC-17: Verify that computed digits and sorted query indices persist to
+    TC-21: Verify that computed digits and sorted query indices persist to
     disk and are seamlessly reloaded on cold start without recalculation.
     """
-    engine1 = PiEngine(data_dir=tmp_path, default_seed_digits=2000)
+    engine1 = PiEngine(data_dir=tmp_path, default_seed_digits=2000, load_seed_pack=False)
     res = engine1.search("1415")
     assert res is not None
 
-    engine2 = PiEngine(data_dir=tmp_path, default_seed_digits=0)
+    engine2 = PiEngine(data_dir=tmp_path, default_seed_digits=0, load_seed_pack=False)
     assert engine2.get_total_cached_digits() == engine1.get_total_cached_digits()
     assert engine2.lookup_cache("1415") == 1
 
 
 # =====================================================================
-# TC-18: Initial 1,000,000-Digit Burst on Cache Miss
+# TC-22: Initial 1,000,000-Digit Burst on Cache Miss
 # =====================================================================
-def test_tc18_initial_burst_on_cache_miss(tmp_path: Path):
+def test_tc22_initial_burst_on_cache_miss(tmp_path: Path):
     """
-    TC-18: Verify that when search() is called with chunk_size=None (default)
+    TC-22: Verify that when search() is called with chunk_size=None (default)
     on a cache miss with fewer than 1,000,000 digits cached, the initial step
     calculates exactly up to 1,000,000 digits before the first checkpoint.
     """
-    engine = PiEngine(data_dir=tmp_path, default_seed_digits=100_000)
+    engine = PiEngine(data_dir=tmp_path, default_seed_digits=100_000, load_seed_pack=False)
     assert engine.get_total_cached_digits() == 100_000
 
     checkpoints = []

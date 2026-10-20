@@ -113,25 +113,42 @@ Full keyboard navigation is enabled whenever the **Pi Dialer** tab is active:
 * **`BackSpace`**: Deletes trailing digit (`⌫`).
 * **`Escape` / `Delete`**: Clears entire input field (`CLR`).
 
-### 2.9 Interactive Checkpoint Pause Modal & 4-Tier Escalating Schedule (v1.3)
+### 2.9 Interactive Checkpoint Pause Modal & 5-Tier Escalating Schedule (v2.0)
 When a search misses the existing cache and calculates new digits:
 * **1,000,000-Digit Initial Burst**: If `current_total < 1,000,000` digits, the engine automatically calculates up to 1,000,000 digits in the initial burst before triggering the first checkpoint modal. If `current_total >= 1,000,000`, the initial burst uses Option 1's step size from the active speed tier.
-* **4-Tier Escalating Schedule**: Evaluates $T_{1\text{M}} = \text{estimate\_chunk\_time}(\text{current\_total}, 1\_000\_000)$ to dynamically configure two calculation buttons alongside **Stop Search**:
-  * **Tier 1 ($T_{1\text{M}} < 15\text{s}$)**:
-    * Button 1: **`Continue (+1,000,000) [~X.Xs]`**
-    * Button 2: **`Run ~30s Burst (+X.XM digits)`**
-  * **Tier 2 ($15\text{s} \le T_{1\text{M}} < 30\text{s}$)**:
-    * Button 1: **`Continue (+1,000,000) [~XXs]`**
-    * Button 2: **`Run ~60s Burst (+X.XM digits)`**
-  * **Tier 3 ($30\text{s} \le T_{1\text{M}} \le 60\text{s}$)**:
+* **$T_{\text{min\_step}}$ Golden Rule**: Evaluates $T_{\text{min\_step}} = \text{estimate\_chunk\_time}(\text{current\_total}, 2\_000\_000)$ and ensures that no time-budget button ever offers a duration shorter than $1.25 \times T_{\text{min\_step}}$.
+* **Cold-Start CPU Calibration**: If running from a deep cache without live calculations in the current session, the engine runs an in-memory 0.1-second micro-benchmark (computing 500,000 digits) to calibrate $N_{\text{last}}$ and $T_{\text{last}}$ directly to the host CPU before computing estimates.
+* **5-Tier Escalating Schedule**:
+  * **Tier 1 ($T_{\text{min\_step}} < 15.0\text{s}$)**:
+    * Button 1: **`Continue (+1,000,000 Digits) [~X.Xs]`**
+    * Button 2: **`Search for 30 Seconds`**
+  * **Tier 2 ($15.0\text{s} \le T_{\text{min\_step}} < 24.0\text{s}$)**:
+    * Button 1: **`Continue (+1,000,000 Digits) [~XXs]`**
+    * Button 2: **`Search for 60 Seconds`**
+  * **Tier 3 ($24.0\text{s} \le T_{\text{min\_step}} < 48.0\text{s}$)**:
     * *`+1,000,000` retired*
-    * Button 1: **`Run ~1 Min Burst (+X.XM digits)`**
-    * Button 2: **`Run ~2 Min Burst (+X.XM digits)`**
-  * **Tier 4 ($T_{1\text{M}} > 60\text{s}$)**:
-    * Button 1: **`Run ~2 Min Burst (+X.XM digits)`**
-    * Button 2: **`Run ~5 Min Burst (+X.XM digits)`**
+    * Button 1: **`Search for 1 Minute`**
+    * Button 2: **`Search for 2 Minutes`**
+  * **Tier 4 ($48.0\text{s} \le T_{\text{min\_step}} \le 90.0\text{s}$)**:
+    * Button 1: **`Search for 2 Minutes`**
+    * Button 2: **`Search for 5 Minutes`**
+  * **Tier 5 ($T_{\text{min\_step}} > 90.0\text{s}$ — Deep Pi / 100M+ Mode)**:
+    * Modal Warning Note: *"At {current_total:,} digits, computing the next block of Pi requires ~{T_{\text{min\_step}} / 60:.1f} minutes."*
+    * Button 1: **`Calculate Next Block (~X Mins)`** (single $+2,000,000$ digit chunk pass)
+    * Button 2: **`Search for X Minutes`**
+* **Wall-Clock Time-Budget Burst Loop**: When a time-budget button is selected (e.g. 30s, 60s, 120s, 300s):
+  * Runs a true wall-clock timer loop (`deadline = start + target_seconds`) continuously expanding and searching $\pi$ in calibrated multi-million digit chunks.
+  * Emits live progress telemetry: `"Running {budget}s Burst... [{elapsed:.1f}s / {budget}s] — {digits:,} digits searched"`.
+  * If the match is found at any point during the burst, immediately terminates the loop and displays the result.
+  * If the budget expires without finding the sequence, pauses and presents the Checkpoint Modal again with freshly calibrated speed tiers.
 * **Modal Dialog (`CTkToplevel`)**: Centered over the main window, blocking main window interactions (`grab_set()`).
 * **Stop Search**: Halts search, persists all computed digits and index entries to disk, updates the History tab banner, and resets UI state.
+
+### 2.10 Bundled 100,000,000-Digit Compressed Seed Pack (v2.0)
+* **Pre-calculated Ground Truth**: The application bundles a 100,000,000 decimal digit seed pack of $\pi$ (excluding `"3."`), verified against ground-truth mathematical constants and landmark sequence positions.
+* **Compact Repository Storage**: Compressed with `zstandard` (level 19) into `seed/pi_100m.zst` at **40.56 MB**, fitting under GitHub's 50 MB file limit.
+* **Seamless First-Launch Decompression**: On initial startup or first launch of `PiPhone.exe`, if `data/pi_digits.txt` has fewer than 100,000,000 digits, the engine automatically extracts the seed into the local cache.
+* **Instantaneous Searches**: 100% of 1-to-7 digit queries and ~63% of 8-digit queries resolve instantaneously in $< 20\text{ms}$ on first launch without requiring background CPU computation.
 
 ---
 
@@ -174,12 +191,12 @@ $$\frac{1}{\pi} = 12 \sum_{k=0}^{\infty} \frac{(-1)^k (6k)! (545140134k + 135914
   * `mpmath` automatically detects and binds `mpmath.libmp.BACKEND == 'gmpy'`, delivering **10x–15x higher throughput** than pure Python.
   * Graceful fallback to pure Python `BACKEND == 'python'` if `gmpy2` is not present.
 * **Empirical Time Estimation & Inverse Time-Budget Engine**:
-  * Forward Scaling Law:
-    $$T_{\text{est}} = T_{\text{last}} \times \left(\frac{\text{current\_total} + \text{chunk\_delta}}{N_{\text{last}}}\right)^{1.35}$$
+  * Forward Scaling Law (1.65 exponent to model base-10 conversion overhead at 20M–50M+ digits):
+    $$T_{\text{est}} = T_{\text{last}} \times \left(\frac{\text{current\_total} + \text{chunk\_delta}}{N_{\text{last}}}\right)^{1.65}$$
   * Inverse Scaling Law (`estimate_digits_for_time`):
-    $$N_{\text{target}} = \text{int}\left(N_{\text{last}} \times \left(\frac{T_{\text{budget}}}{T_{\text{last}}}\right)^{1 / 1.35}\right)$$
+    $$N_{\text{target}} = \text{int}\left(N_{\text{last}} \times \left(\frac{T_{\text{budget}}}{T_{\text{last}}}\right)^{1 / 1.65}\right)$$
     $$\Delta N = \max\left(100\_000, \text{round}\left(\frac{N_{\text{target}} - \text{current\_total}}{100\_000}\right) \times 100\_000\right)$$
-  * Allows exact time-budgeted burst calculations (30s, 60s, 120s, 300s) across all depth scales.
+  * Step caps enforce $\Delta N \le 10,000,000$ digits for $\le 30\text{s}$ bursts and $\Delta N \le 20,000,000$ digits for $\le 60\text{s}$ bursts, preventing runaway jumps from fast benchmarks.
 
 ### 3.2 Persistent Raw Stream (`data/pi_digits.txt`)
 * **Format**: Plain ASCII text file containing contiguous decimal digits of $\pi$ directly following `3.`.

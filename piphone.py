@@ -11,7 +11,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 # Explicit import for PyInstaller bundling compatibility on Python 3.12+ and C-extensions
 try:
@@ -82,9 +82,14 @@ class CheckpointModal(ctk.CTkToplevel):
             f"Match not found yet.\n\n"
             f"Calculated {new_digits:,} new digits\n"
             f"(Total Pi Digits Cached: {total_cached:,}).\n\n"
-            f"Speed Tier {tier_config.tier} (1M est: {PiEngine.format_estimated_time(tier_config.t_1m)})\n"
-            f"Select next calculation budget:"
+            f"Speed Tier {tier_config.tier} (Min Step est: {PiEngine.format_estimated_time(tier_config.t_min_step)})\n"
         )
+        if tier_config.note:
+            msg += f"\n{tier_config.note}\n\nSelect next calculation budget:"
+            self.geometry("440x350")
+        else:
+            msg += "Select next calculation budget:"
+            self.geometry("420x310")
 
         self.lbl_msg = ctk.CTkLabel(
             self,
@@ -106,7 +111,7 @@ class CheckpointModal(ctk.CTkToplevel):
             hover_color="#1B5E20",
             font=ctk.CTkFont(size=12, weight="bold"),
             height=32,
-            command=lambda: self._select_action(tier_config.option1.delta_digits),
+            command=lambda: self._select_action(tier_config.option1),
         )
         self.btn_opt1.pack(fill="x", pady=3)
 
@@ -118,7 +123,7 @@ class CheckpointModal(ctk.CTkToplevel):
             hover_color="#01579B",
             font=ctk.CTkFont(size=12, weight="bold"),
             height=32,
-            command=lambda: self._select_action(tier_config.option2.delta_digits),
+            command=lambda: self._select_action(tier_config.option2),
         )
         self.btn_opt2.pack(fill="x", pady=3)
 
@@ -134,7 +139,7 @@ class CheckpointModal(ctk.CTkToplevel):
         )
         self.btn_stop.pack(fill="x", pady=3)
 
-    def _select_action(self, action: str | int):
+    def _select_action(self, action: Any):
         """Releases grab, destroys modal, and invokes the synchronization callback."""
         if not self._action_taken:
             self._action_taken = True
@@ -653,14 +658,14 @@ class PiPhoneApp(ctk.CTk):
         Supports progress updates and synchronous checkpoint modal pausing
         with the 4-tier escalating schedule.
         """
-        def progress_cb(digits_searched: int, elapsed: float):
-            self._msg_queue.put(("progress", (digits_searched, elapsed)))
+        def progress_cb(digits_searched: int, elapsed: float, status_msg: Optional[str] = None):
+            self._msg_queue.put(("progress", (digits_searched, elapsed, status_msg)))
 
         def checkpoint_cb(
             new_digits: int,
             total_cached: int,
             tier_config: Optional[CheckpointTierConfig] = None,
-        ) -> str | int | None:
+        ) -> Any:
             # Check if user already clicked Cancel
             if self._cancel_event.is_set():
                 return "stop"
@@ -670,7 +675,7 @@ class PiPhoneApp(ctk.CTk):
 
             # Create synchronization primitives
             response_event = threading.Event()
-            response_holder: dict[str, str | int] = {"action": "stop"}
+            response_holder: dict[str, Any] = {"action": "stop"}
 
             # Send checkpoint request with tier_config to Tkinter GUI thread
             self._msg_queue.put(
@@ -703,11 +708,18 @@ class PiPhoneApp(ctk.CTk):
             while True:
                 msg_type, payload = self._msg_queue.get_nowait()
                 if msg_type == "progress":
-                    digits_searched, elapsed = payload
+                    payload_tuple = payload
+                    digits_searched = payload_tuple[0]
+                    elapsed = payload_tuple[1]
+                    status_msg = payload_tuple[2] if len(payload_tuple) > 2 else None
+
                     self.lbl_position.configure(text="Calculating Pi...")
-                    self.lbl_telemetry.configure(
-                        text=f"Calculating Pi... {digits_searched:,} digits searched ({elapsed:.1f}s elapsed)"
-                    )
+                    if status_msg:
+                        self.lbl_telemetry.configure(text=status_msg)
+                    else:
+                        self.lbl_telemetry.configure(
+                            text=f"Calculating Pi... {digits_searched:,} digits searched ({elapsed:.1f}s elapsed)"
+                        )
                 elif msg_type == "checkpoint":
                     (
                         new_digits,
@@ -739,10 +751,10 @@ class PiPhoneApp(ctk.CTk):
         total_cached: int,
         tier_config: CheckpointTierConfig,
         response_event: threading.Event,
-        response_holder: dict[str, str | int],
+        response_holder: dict[str, Any],
     ):
         """Opens the checkpoint pause modal with the 4-tier escalating schedule on the GUI thread."""
-        def on_action(action: str | int):
+        def on_action(action: Any):
             response_holder["action"] = action
             response_event.set()
             if action == "stop":

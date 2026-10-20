@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import bisect
 import json
+import math
 import os
 import re
 import sys
@@ -15,7 +16,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 # Explicit import for PyInstaller bundling of C-extensions
 try:
@@ -44,6 +45,58 @@ def get_app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def get_seed_path() -> Optional[Path]:
+    """
+    Locates the bundled 100M seed file in PyInstaller temp dir or project seed/ dir.
+    Supports .zst, .xz, and .gz extensions.
+    """
+    search_dirs: list[Path] = []
+    # 1. PyInstaller frozen unpacked bundle dir
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        search_dirs.append(Path(sys._MEIPASS) / "seed")
+        search_dirs.append(Path(sys._MEIPASS))
+    # 2. Executable root or script root
+    app_dir = get_app_dir()
+    search_dirs.append(app_dir / "seed")
+    search_dirs.append(app_dir)
+
+    for d in search_dirs:
+        for fname in ["pi_100m.zst", "pi_100m.xz", "pi_100m.gz", "pi_100m.txt.gz"]:
+            candidate = d / fname
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def decompress_seed_file(seed_path: Path) -> str:
+    """
+    Decompresses the 100M seed archive into raw ASCII Pi digits string.
+    Supports zstandard, lzma, and gzip.
+    """
+    name = seed_path.name
+    with open(seed_path, "rb") as f:
+        data = f.read()
+
+    if name.endswith(".zst"):
+        try:
+            import zstandard as zstd
+            dctx = zstd.ZstdDecompressor()
+            raw_bytes = dctx.decompress(data)
+            return raw_bytes.decode("ascii")
+        except ImportError:
+            pass
+
+    if name.endswith(".xz"):
+        import lzma
+        return lzma.decompress(data).decode("ascii")
+
+    if name.endswith(".gz"):
+        import gzip
+        return gzip.decompress(data).decode("ascii")
+
+    raise RuntimeError(f"Unsupported seed compression format: {name}")
 
 
 def validate_query(query: str) -> str:
@@ -108,19 +161,25 @@ def format_context(
     return preceding, target, following
 
 
-def compute_pi_digits(num_digits: int, guard_digits: int = 15) -> str:
+def compute_pi_digits(total_digits: int, guard_digits: int = 20) -> str:
     """
-    Computes `num_digits` decimal digits of Pi (excluding '3.') using mpmath.
+    Computes `total_digits` decimal digits of Pi (excluding '3.') using mpmath.
     The Chudnovsky algorithm is the underlying arbitrary-precision driver in mpmath.
+    Always uses total_digits + 20 dps to eliminate boundary rounding errors,
+    converts via mpmath.nstr(mpmath.mp.pi, total_digits + 10), and strictly
+    extracts the decimal expansion after '3.'.
     """
-    if num_digits <= 0:
+    if total_digits <= 0:
         return ""
-    # Set decimal precision with guard digits to avoid boundary rounding error
-    mpmath.mp.dps = num_digits + guard_digits
-    pi_str = mpmath.nstr(mpmath.pi, n=num_digits + guard_digits)
-    # pi_str starts with "3." followed by the decimal expansion
-    decimal_digits = pi_str[2 : 2 + num_digits]
-    return decimal_digits
+    # Set decimal precision with 20 guard digits so the last digit never suffers boundary rounding
+    mpmath.mp.dps = total_digits + guard_digits
+    raw_str = mpmath.nstr(mpmath.mp.pi, total_digits + 10)
+    parts = raw_str.split(".")
+    if len(parts) > 1:
+        decimals = parts[1][:total_digits]
+    else:
+        decimals = raw_str[2 : 2 + total_digits]
+    return decimals
 
 
 def format_delta_digits(delta: int) -> str:
@@ -139,8 +198,9 @@ def format_delta_digits(delta: int) -> str:
 @dataclass
 class CheckpointOption:
     label: str
-    delta_digits: int
+    delta_digits: int = 0
     target_seconds: Optional[float] = None
+    mode: str = "fixed_digits"  # "fixed_digits" or "time_budget"
 
 
 @dataclass
@@ -150,6 +210,8 @@ class CheckpointTierConfig:
     option1: CheckpointOption
     option2: CheckpointOption
     description: str = ""
+    t_min_step: float = 0.0
+    note: str = ""
 
 
 @dataclass
@@ -169,16 +231,28 @@ class PiEngine:
     Persistent calculation and search engine for Pi digits.
     """
 
-    def __init__(self, data_dir: str | Path | None = None, default_seed_digits: int = 10_000):
+    def __init__(
+        self,
+        data_dir: str | Path | None = None,
+        default_seed_digits: int = 10_000,
+        load_seed_pack: Optional[bool] = None,
+    ):
         if data_dir is None:
             self.data_dir = get_app_dir() / "data"
+            is_production_default = True
         else:
             p = Path(data_dir)
             if p.is_absolute():
                 self.data_dir = p
             else:
                 self.data_dir = get_app_dir() / p
+            is_production_default = False
         self.data_dir.mkdir(parents=True, exist_ok=True)
+
+        if load_seed_pack is None:
+            self._should_load_seed = is_production_default or (default_seed_digits >= 100_000_000)
+        else:
+            self._should_load_seed = load_seed_pack
 
         self.digits_file = self.data_dir / "pi_digits.txt"
         self.index_file = self.data_dir / "pi_index.json"
@@ -192,7 +266,7 @@ class PiEngine:
         self.prefix_index: list[tuple[str, int]] = []
 
         # Empirical calculation benchmark tracking
-        # Baseline calibration: gmpy2 ~0.05s per 100k, pure Python ~0.35s
+        self.has_calibrated_benchmark: bool = False
         if BACKEND_NAME == "gmpy":
             self.last_calc_digits: int = 100_000
             self.last_calc_time: float = 0.05
@@ -202,12 +276,43 @@ class PiEngine:
 
         self._load_state(default_seed_digits)
 
+    def calibrate_benchmark(self, force: bool = False) -> None:
+        """
+        Runs a quick micro-benchmark (calculating 500,000 digits in memory)
+        to calibrate N_last and T_last to the exact host CPU performance,
+        without modifying or overwriting self.digits or disk files.
+        """
+        if self.has_calibrated_benchmark and not force:
+            return
+
+        bench_digits = 500_000
+        t_start = time.perf_counter()
+        _ = compute_pi_digits(bench_digits)
+        elapsed = time.perf_counter() - t_start
+
+        self.last_calc_digits = bench_digits
+        self.last_calc_time = max(0.001, elapsed)
+        self.has_calibrated_benchmark = True
+
     def _load_state(self, default_seed_digits: int) -> None:
-        """Loads cached digits and sorted indices from disk, or seeds initial digits."""
+        """Loads cached digits and sorted indices from disk, extracts bundled seed, or seeds initial digits."""
         if self.digits_file.exists():
             with open(self.digits_file, "r", encoding="ascii") as f:
                 self.digits = f.read().strip()
-        
+
+        # Extract bundled 100M seed if available and enabled
+        if len(self.digits) < 100_000_000 and self._should_load_seed:
+            seed_path = get_seed_path()
+            if seed_path is not None:
+                try:
+                    seed_digits = decompress_seed_file(seed_path)
+                    if len(seed_digits) >= 100_000_000:
+                        self.digits = seed_digits
+                        with open(self.digits_file, "w", encoding="ascii") as f:
+                            f.write(self.digits)
+                except Exception:
+                    pass
+
         # Seed initial digits if empty and requested
         if len(self.digits) < default_seed_digits and default_seed_digits > 0:
             initial = compute_pi_digits(default_seed_digits)
@@ -226,62 +331,31 @@ class PiEngine:
                 self.query_cache = []
                 self.prefix_index = []
 
-        # Ensure indices are strictly sorted using Timsort
+        # Ensure query cache is strictly sorted using Timsort
         self._sort_indices()
 
-        # Build prefix index from current digits if prefix_index is empty
-        if not self.prefix_index and len(self.digits) >= 4:
-            self._rebuild_prefix_index()
-
     def _sort_indices(self) -> None:
-        """Sorts cache and prefix indices using Python's native Timsort."""
+        """Sorts query cache using Python's native Timsort."""
         self.query_cache.sort(key=lambda x: x[0])
         self.prefix_index.sort(key=lambda x: x[0])
 
-    def _rebuild_prefix_index(self) -> None:
-        """Builds a 4-digit prefix index of first occurrences in self.digits."""
-        seen: dict[str, int] = {}
-        for i in range(len(self.digits) - 3):
-            prefix = self.digits[i : i + 4]
-            if prefix not in seen:
-                seen[prefix] = i + 1  # 1-based position
-        
-        self.prefix_index = [(k, v) for k, v in seen.items()]
-        self._sort_indices()
-        self._save_index()
-
-    def _update_prefix_index(self, old_len: int) -> None:
-        """
-        Incrementally indexes 4-digit prefixes across the boundary and newly calculated digits.
-        Scans from max(0, old_len - 3) to len(self.digits) - 3.
-        Only records prefixes that have not been seen before.
-        """
-        if len(self.digits) < 4:
-            return
-
-        existing_prefixes = {item[0] for item in self.prefix_index}
-        new_entries: list[tuple[str, int]] = []
-        start_idx = max(0, old_len - 3)
-
-        for i in range(start_idx, len(self.digits) - 3):
-            prefix = self.digits[i : i + 4]
-            if prefix not in existing_prefixes:
-                existing_prefixes.add(prefix)
-                new_entries.append((prefix, i + 1))
-
-        if new_entries:
-            self.prefix_index.extend(new_entries)
-            self._sort_indices()
-            self._save_index()
-
     def _save_index(self) -> None:
-        """Saves sorted indices to disk."""
+        """Saves sorted query cache to disk."""
         data = {
             "query_cache": self.query_cache,
             "prefix_index": self.prefix_index,
         }
         with open(self.index_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+
+    @property
+    def pi_digits(self) -> str:
+        """Alias for self.digits ensuring compatibility with pi_digits references."""
+        return self.digits
+
+    @pi_digits.setter
+    def pi_digits(self, value: str) -> None:
+        self.digits = value
 
     def lookup_cache(self, query: str) -> Optional[int]:
         """
@@ -298,15 +372,14 @@ class PiEngine:
 
     def lookup_prefix(self, prefix: str) -> Optional[int]:
         """
-        Binary search against the sorted 4-digit prefix index.
-        Returns first occurrence 1-based position if found.
+        Returns first occurrence 1-based position of 4-digit prefix.
+        Fast C-level find guarantees 100% determinism without skipped ranges.
         """
-        if not self.prefix_index or len(prefix) != 4:
+        if len(prefix) != 4:
             return None
-        keys = [item[0] for item in self.prefix_index]
-        idx = bisect.bisect_left(keys, prefix)
-        if idx < len(self.prefix_index) and self.prefix_index[idx][0] == prefix:
-            return self.prefix_index[idx][1]
+        idx = self.digits.find(prefix)
+        if idx != -1:
+            return idx + 1
         return None
 
     def record_query_match(self, query: str, position_1based: int) -> None:
@@ -320,7 +393,7 @@ class PiEngine:
                 self._save_index()
 
     def search_cached_digits(self, query: str) -> Optional[int]:
-        """Scans current in-memory digits for query. Returns 1-based position or None."""
+        """Scans current in-memory digits for query from index 0 across entire string. Returns 1-based position or None."""
         idx = self.digits.find(query)
         if idx != -1:
             return idx + 1
@@ -355,7 +428,7 @@ class PiEngine:
             return 0.05
         target = current_total + chunk_delta
         ratio = max(0.001, target / self.last_calc_digits)
-        return float(self.last_calc_time * (ratio ** 1.35))
+        return float(self.last_calc_time * (ratio ** 1.65))
 
     @staticmethod
     def format_estimated_time(seconds: float) -> str:
@@ -392,50 +465,71 @@ class PiEngine:
         est_1m = self.estimate_chunk_time(current_total, 1_000_000)
         return est_1m <= 60.0
 
-    def estimate_digits_for_time(self, current_total: int, target_seconds: float) -> int:
+    def estimate_digits_for_time(
+        self,
+        current_total: int,
+        target_seconds: float,
+        min_floor: int = 100_000,
+        max_cap: Optional[int] = 25_000_000,
+    ) -> int:
         """
         Calculates the number of incremental digits Delta N that can be computed
         within a target time budget (target_seconds) based on the inverse scaling law:
-            N_target = int(N_last * (target_seconds / T_last) ** (1 / 1.35))
-            Delta N = max(100_000, round((N_target - current_total) / 100_000) * 100_000)
+            N_target = int(N_last * (target_seconds / T_last) ** (1 / 1.65))
+            Delta N = max(min_floor, round((N_target - current_total) / 100_000) * 100_000)
+        Enforces min_floor (default 100,000) and max_cap (default 25,000,000).
 
         Args:
             current_total: Number of decimal digits currently calculated.
             target_seconds: Desired wall-clock time budget in seconds.
+            min_floor: Minimum incremental digits floor.
+            max_cap: Maximum incremental digits ceiling (e.g. 25M).
 
         Returns:
-            int: Incremental digits to calculate, rounded to the nearest 100,000,
-                 guaranteed to be at least 100,000.
+            int: Incremental digits to calculate, rounded to the nearest 100,000.
         """
         if target_seconds <= 0:
-            return 100_000
+            return min_floor
 
         n_last = max(100_000, self.last_calc_digits)
         t_last = max(0.001, self.last_calc_time)
 
         ratio = target_seconds / t_last
-        n_target = int(n_last * (ratio ** (1.0 / 1.35)))
+        n_target = int(n_last * (ratio ** (1.0 / 1.65)))
         raw_delta = n_target - current_total
 
-        # Round to nearest 100,000 with minimum floor of 100,000
+        # Round to nearest 100,000 with minimum floor
         rounded_delta = round(raw_delta / 100_000) * 100_000
-        return max(100_000, rounded_delta)
+        delta = max(min_floor, rounded_delta)
+
+        # Cap delta to prevent runaway single-step calculations
+        if max_cap is not None:
+            delta = min(delta, max_cap)
+
+        return delta
 
     def get_checkpoint_tier_config(self, current_total: int) -> CheckpointTierConfig:
         """
-        Evaluates the 4-tier escalating checkpoint schedule based on T_1M:
-        - Tier 1 (T_1M < 15s):
-            Option 1: Continue (+1,000,000) [~X.Xs]
-            Option 2: Run ~30s Burst (+X.XM digits)
-        - Tier 2 (15s <= T_1M < 30s):
-            Option 1: Continue (+1,000,000) [~XXs]
-            Option 2: Run ~60s Burst (+X.XM digits)
-        - Tier 3 (30s <= T_1M <= 60s):
-            Option 1: Run ~1 Min Burst (+X.XM digits)
-            Option 2: Run ~2 Min Burst (+X.XM digits)
-        - Tier 4 (T_1M > 60s):
-            Option 1: Run ~2 Min Burst (+X.XM digits)
-            Option 2: Run ~5 Min Burst (+X.XM digits)
+        Evaluates the 5-tier escalating checkpoint schedule based on T_min_step
+        (minimum step = +2,000,000 digits) and T_1M, enforcing the Golden Rule:
+        A time-budget button may NEVER offer a duration shorter than 1.25 * T_min_step.
+
+        - Tier 1 (t_min_step < 15.0s):
+            Option 1: Continue (+1,000,000 Digits) [~X.Xs]
+            Option 2: Search for 30 Seconds
+        - Tier 2 (15.0s <= t_min_step < 24.0s):
+            Option 1: Continue (+1,000,000 Digits) [~XXs]
+            Option 2: Search for 60 Seconds
+        - Tier 3 (24.0s <= t_min_step < 48.0s):
+            Option 1: Search for 1 Minute
+            Option 2: Search for 2 Minutes
+        - Tier 4 (48.0s <= t_min_step <= 90.0s):
+            Option 1: Search for 2 Minutes
+            Option 2: Search for 5 Minutes
+        - Tier 5 (t_min_step > 90.0s — Deep Pi / 100M+ Mode):
+            Option 1: Calculate Next Block (~{ceil(t_min_step / 60)} Mins)
+            Option 2: Search for {ceil(t_min_step * 2.2 / 60)} Minutes
+            Informative Note: "At {current_total:,} digits, computing the next block of Pi requires ~{t_min_step / 60:.1f} minutes."
 
         Args:
             current_total: Number of decimal digits currently cached.
@@ -443,86 +537,131 @@ class PiEngine:
         Returns:
             CheckpointTierConfig with configured options and metadata.
         """
+        # Ensure CPU benchmark is calibrated if dealing with deep caches
+        if current_total >= 10_000_000 and not self.has_calibrated_benchmark:
+            self.calibrate_benchmark()
+
+        t_min_step = self.estimate_chunk_time(current_total, 2_000_000)
         t_1m = self.estimate_chunk_time(current_total, 1_000_000)
         fmt_1m = self.format_estimated_time(t_1m)
 
-        if t_1m < 15.0:
+        if t_min_step < 15.0:
             d_30s = self.estimate_digits_for_time(current_total, 30.0)
             opt1 = CheckpointOption(
-                label=f"Continue (+1,000,000) {fmt_1m}",
+                label=f"Continue (+1,000,000 Digits) {fmt_1m}",
                 delta_digits=1_000_000,
                 target_seconds=t_1m,
+                mode="fixed_digits",
             )
             opt2 = CheckpointOption(
-                label=f"Run ~30s Burst ({format_delta_digits(d_30s)})",
+                label="Search for 30 Seconds",
                 delta_digits=d_30s,
                 target_seconds=30.0,
+                mode="time_budget",
             )
             return CheckpointTierConfig(
                 tier=1,
                 t_1m=t_1m,
+                t_min_step=t_min_step,
                 option1=opt1,
                 option2=opt2,
-                description="Fast calculation (< 15s per 1M digits)",
+                description="Fast calculation (< 15s per min step)",
             )
-        elif t_1m < 30.0:
+        elif t_min_step < 24.0:
             d_60s = self.estimate_digits_for_time(current_total, 60.0)
             opt1 = CheckpointOption(
-                label=f"Continue (+1,000,000) {fmt_1m}",
+                label=f"Continue (+1,000,000 Digits) {fmt_1m}",
                 delta_digits=1_000_000,
                 target_seconds=t_1m,
+                mode="fixed_digits",
             )
             opt2 = CheckpointOption(
-                label=f"Run ~60s Burst ({format_delta_digits(d_60s)})",
+                label="Search for 60 Seconds",
                 delta_digits=d_60s,
                 target_seconds=60.0,
+                mode="time_budget",
             )
             return CheckpointTierConfig(
                 tier=2,
                 t_1m=t_1m,
+                t_min_step=t_min_step,
                 option1=opt1,
                 option2=opt2,
-                description="Moderate calculation (15s - 30s per 1M digits)",
+                description="Moderate calculation (15s - 24s per min step)",
             )
-        elif t_1m <= 60.0:
+        elif t_min_step < 48.0:
             d_60s = self.estimate_digits_for_time(current_total, 60.0)
             d_120s = self.estimate_digits_for_time(current_total, 120.0)
             opt1 = CheckpointOption(
-                label=f"Run ~1 Min Burst ({format_delta_digits(d_60s)})",
+                label="Search for 1 Minute",
                 delta_digits=d_60s,
                 target_seconds=60.0,
+                mode="time_budget",
             )
             opt2 = CheckpointOption(
-                label=f"Run ~2 Min Burst ({format_delta_digits(d_120s)})",
+                label="Search for 2 Minutes",
                 delta_digits=d_120s,
                 target_seconds=120.0,
+                mode="time_budget",
             )
             return CheckpointTierConfig(
                 tier=3,
                 t_1m=t_1m,
+                t_min_step=t_min_step,
                 option1=opt1,
                 option2=opt2,
-                description="Extended calculation (30s - 60s per 1M digits; +1M retired)",
+                description="Extended calculation (24s - 48s per min step; +1M retired)",
             )
-        else:
+        elif t_min_step <= 90.0:
             d_120s = self.estimate_digits_for_time(current_total, 120.0)
             d_300s = self.estimate_digits_for_time(current_total, 300.0)
             opt1 = CheckpointOption(
-                label=f"Run ~2 Min Burst ({format_delta_digits(d_120s)})",
+                label="Search for 2 Minutes",
                 delta_digits=d_120s,
                 target_seconds=120.0,
+                mode="time_budget",
             )
             opt2 = CheckpointOption(
-                label=f"Run ~5 Min Burst ({format_delta_digits(d_300s)})",
+                label="Search for 5 Minutes",
                 delta_digits=d_300s,
                 target_seconds=300.0,
+                mode="time_budget",
             )
             return CheckpointTierConfig(
                 tier=4,
                 t_1m=t_1m,
+                t_min_step=t_min_step,
                 option1=opt1,
                 option2=opt2,
-                description="Deep calculation (> 60s per 1M digits)",
+                description="Heavy calculation (48s - 90s per min step)",
+            )
+        else:
+            mins_step = math.ceil(t_min_step / 60.0)
+            mins_search = math.ceil((t_min_step * 2.2) / 60.0)
+            note = (
+                f"At {current_total:,} digits, computing the next block of Pi "
+                f"requires ~{t_min_step / 60.0:.1f} minutes."
+            )
+            opt1 = CheckpointOption(
+                label=f"Calculate Next Block (~{mins_step} Mins)",
+                delta_digits=2_000_000,
+                target_seconds=max(1.25 * t_min_step, 180.0),
+                mode="fixed_digits",
+            )
+            opt2 = CheckpointOption(
+                label=f"Search for {mins_search} Minutes",
+                delta_digits=4_000_000,
+                target_seconds=mins_search * 60.0,
+                mode="time_budget",
+            )
+            return CheckpointTierConfig(
+                tier=5,
+                t_1m=t_1m,
+                t_min_step=t_min_step,
+                option1=opt1,
+                option2=opt2,
+                description="Deep Pi calculation (> 90s per min step; 100M+ mode)",
+                note=note,
             )
 
     def search(
@@ -581,19 +720,20 @@ class PiEngine:
                 new_digits_calculated=0,
             )
 
-        # Step 2: Scan existing cached digits
-        pos_in_cache = self.search_cached_digits(clean_query)
-        if pos_in_cache is not None:
-            needed_len = pos_in_cache - 1 + len(clean_query) + 4
+        # Step 2: Scan existing cached digits from index 0 across entire string
+        pos_in_cache = self.digits.find(clean_query)
+        if pos_in_cache != -1:
+            global_pos = pos_in_cache + 1
+            needed_len = pos_in_cache + len(clean_query) + 4
             if len(self.digits) < needed_len:
                 self._expand_to_length(needed_len)
 
-            self.record_query_match(clean_query, pos_in_cache)
+            self.record_query_match(clean_query, global_pos)
             elapsed = time.perf_counter() - start_time
-            preceding, target, following = format_context(self.digits, pos_in_cache, len(clean_query))
+            preceding, target, following = format_context(self.digits, global_pos, len(clean_query))
             return SearchResult(
                 query=clean_query,
-                position=pos_in_cache,
+                position=global_pos,
                 preceding=preceding,
                 target=target,
                 following=following,
@@ -602,81 +742,167 @@ class PiEngine:
                 new_digits_calculated=0,
             )
 
-        # Step 3: Dynamic chunk expansion with checkpoint pausing
+        # Step 3: Dynamic chunk expansion with checkpoint pausing & wall-clock budget loops
         q_len = len(clean_query)
-        overlap_len = q_len - 1
         new_digits_total = 0
 
         current_len = len(self.digits)
         if chunk_size is not None:
-            current_step = chunk_size
+            pending_action: Any = chunk_size
         else:
             if current_len < 1_000_000:
-                current_step = 1_000_000 - current_len
+                pending_action = 1_000_000 - current_len
             else:
                 tier_cfg = self.get_checkpoint_tier_config(current_len)
-                current_step = tier_cfg.option1.delta_digits
+                pending_action = tier_cfg.option1
+
+        def report_progress(digits_searched: int, elapsed: float, status_msg: Optional[str] = None):
+            if progress_callback:
+                try:
+                    progress_callback(digits_searched, elapsed, status_msg)
+                except TypeError:
+                    progress_callback(digits_searched, elapsed)
 
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 return None
 
-            current_len = len(self.digits)
-            target_len = current_len + current_step
+            # Determine whether pending_action is a time-budget burst or a fixed digit step
+            is_time_budget = False
+            target_seconds = 0.0
 
-            # Generate new chunk using Chudnovsky algorithm with timing calibration
-            t_calc_start = time.perf_counter()
-            new_digits = compute_pi_digits(target_len)
-            calc_duration = time.perf_counter() - t_calc_start
+            if isinstance(pending_action, CheckpointOption):
+                if pending_action.mode == "time_budget" and pending_action.target_seconds:
+                    is_time_budget = True
+                    target_seconds = float(pending_action.target_seconds)
+                else:
+                    step_delta = pending_action.delta_digits if pending_action.delta_digits > 0 else 1_000_000
+            elif isinstance(pending_action, dict) and pending_action.get("mode") == "time_budget":
+                is_time_budget = True
+                target_seconds = float(pending_action.get("seconds", 30.0))
+            elif isinstance(pending_action, float):
+                is_time_budget = True
+                target_seconds = pending_action
+            elif isinstance(pending_action, int) and pending_action > 0:
+                step_delta = pending_action
+            else:
+                step_delta = 1_000_000
 
-            # Calibrate empirical benchmark with real computation metrics
-            self.last_calc_digits = target_len
-            self.last_calc_time = max(0.001, calc_duration)
+            if is_time_budget:
+                start_burst = time.perf_counter()
+                deadline = start_burst + target_seconds
+                budget_label = int(target_seconds) if target_seconds.is_integer() else f"{target_seconds:.1f}"
 
-            new_chunk = new_digits[current_len:]
-            new_digits_total += len(new_chunk)
+                while time.perf_counter() < deadline:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return None
 
-            # Search in window: tail of old digits (overlap) + new_chunk
-            overlap_start = max(0, current_len - overlap_len)
-            overlap_slice = self.digits[overlap_start:]
-            search_window = overlap_slice + new_chunk
+                    now = time.perf_counter()
+                    elapsed_burst = now - start_burst
+                    remaining_time = max(0.0, deadline - now)
 
-            window_idx = search_window.find(clean_query)
+                    # Exit burst if remaining time is insufficient for a safe multi-million chunk
+                    exit_thresh = 2.0 if target_seconds > 3.0 else min(0.2, target_seconds * 0.15)
+                    if remaining_time < exit_thresh and elapsed_burst > 0.05:
+                        break
 
-            # Update master digits and persist to disk
-            with self._lock:
-                self.digits = new_digits
-                with open(self.digits_file, "w", encoding="ascii") as f:
-                    f.write(self.digits)
-                self._update_prefix_index(current_len)
+                    min_floor = 2_000_000 if target_seconds > 3.0 else 50_000
+                    delta_n = self.estimate_digits_for_time(
+                        len(self.digits),
+                        remaining_time,
+                        min_floor=min_floor,
+                        max_cap=25_000_000,
+                    )
 
-            if progress_callback:
-                progress_callback(len(self.digits), time.perf_counter() - start_time)
+                    old_total = len(self.digits)
+                    target_len = old_total + delta_n
 
-            if window_idx != -1:
-                # Match found! Calculate global 1-based position
-                global_pos = (overlap_start + window_idx) + 1
+                    t_calc_start = time.perf_counter()
+                    new_digits = compute_pi_digits(target_len)
+                    calc_duration = time.perf_counter() - t_calc_start
 
-                # Ensure we have 4 following digits for context
-                needed_len = global_pos - 1 + q_len + 4
-                if len(self.digits) < needed_len:
-                    self._expand_to_length(needed_len)
+                    self.last_calc_digits = target_len
+                    self.last_calc_time = max(0.001, calc_duration)
+                    new_digits_total += (len(new_digits) - old_total)
 
-                self.record_query_match(clean_query, global_pos)
-                elapsed = time.perf_counter() - start_time
-                preceding, target, following = format_context(self.digits, global_pos, q_len)
-                return SearchResult(
-                    query=clean_query,
-                    position=global_pos,
-                    preceding=preceding,
-                    target=target,
-                    following=following,
-                    elapsed_seconds=elapsed,
-                    source=f"Calculated {new_digits_total:,} new digits",
-                    new_digits_calculated=new_digits_total,
-                )
+                    with self._lock:
+                        self.digits = new_digits
+                        with open(self.digits_file, "w", encoding="ascii") as f:
+                            f.write(self.digits)
 
-            # Checkpoint Pause: Sequence not found yet in this chunk
+                    cur_elapsed = time.perf_counter() - start_burst
+                    report_progress(
+                        len(self.digits),
+                        time.perf_counter() - start_time,
+                        f"Running {budget_label}s Burst... [{cur_elapsed:.1f}s / {budget_label}s] — {len(self.digits):,} digits searched",
+                    )
+
+                    # Substring match search across newly expanded digits + boundary stitch
+                    scan_start = max(0, old_total - q_len + 1)
+                    idx = self.digits.find(clean_query, scan_start)
+                    if idx != -1:
+                        global_pos = idx + 1
+                        needed_len = idx + q_len + 4
+                        if len(self.digits) < needed_len:
+                            self._expand_to_length(needed_len)
+
+                        self.record_query_match(clean_query, global_pos)
+                        elapsed = time.perf_counter() - start_time
+                        preceding, target, following = format_context(self.digits, global_pos, q_len)
+                        return SearchResult(
+                            query=clean_query,
+                            position=global_pos,
+                            preceding=preceding,
+                            target=target,
+                            following=following,
+                            elapsed_seconds=elapsed,
+                            source=f"Calculated {new_digits_total:,} new digits",
+                            new_digits_calculated=new_digits_total,
+                        )
+
+            else:
+                # Fixed digit chunk expansion
+                old_total = len(self.digits)
+                target_len = old_total + step_delta
+
+                t_calc_start = time.perf_counter()
+                new_digits = compute_pi_digits(target_len)
+                calc_duration = time.perf_counter() - t_calc_start
+
+                self.last_calc_digits = target_len
+                self.last_calc_time = max(0.001, calc_duration)
+                new_digits_total += (len(new_digits) - old_total)
+
+                with self._lock:
+                    self.digits = new_digits
+                    with open(self.digits_file, "w", encoding="ascii") as f:
+                        f.write(self.digits)
+
+                report_progress(len(self.digits), time.perf_counter() - start_time)
+
+                scan_start = max(0, old_total - q_len + 1)
+                idx = self.digits.find(clean_query, scan_start)
+                if idx != -1:
+                    global_pos = idx + 1
+                    needed_len = idx + q_len + 4
+                    if len(self.digits) < needed_len:
+                        self._expand_to_length(needed_len)
+
+                    self.record_query_match(clean_query, global_pos)
+                    elapsed = time.perf_counter() - start_time
+                    preceding, target, following = format_context(self.digits, global_pos, q_len)
+                    return SearchResult(
+                        query=clean_query,
+                        position=global_pos,
+                        preceding=preceding,
+                        target=target,
+                        following=following,
+                        elapsed_seconds=elapsed,
+                        source=f"Calculated {new_digits_total:,} new digits",
+                        new_digits_calculated=new_digits_total,
+                    )
+
+            # Checkpoint Pause: Sequence not found yet in this chunk or wall-clock burst
             if checkpoint_callback is not None:
                 tier_cfg = self.get_checkpoint_tier_config(len(self.digits))
                 try:
@@ -696,14 +922,16 @@ class PiEngine:
 
                 if action == "stop" or action is None:
                     return None
-                elif isinstance(action, int) and action > 0:
-                    current_step = action
+                else:
+                    pending_action = action
+            else:
+                # If no callback provided, default to 1,000,000 digits continuation
+                pending_action = 1_000_000
 
     def _expand_to_length(self, target_len: int) -> None:
         """Expands self.digits to at least target_len digits and saves to disk."""
         if len(self.digits) < target_len:
             with self._lock:
-                old_len = len(self.digits)
                 t_calc_start = time.perf_counter()
                 self.digits = compute_pi_digits(target_len)
                 calc_duration = time.perf_counter() - t_calc_start
@@ -711,7 +939,6 @@ class PiEngine:
                 self.last_calc_time = max(0.001, calc_duration)
                 with open(self.digits_file, "w", encoding="ascii") as f:
                     f.write(self.digits)
-                self._update_prefix_index(old_len)
 
     def log_history(self, result: SearchResult) -> None:
         """Appends a search result to the search history JSON log."""
