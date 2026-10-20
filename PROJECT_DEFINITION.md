@@ -210,18 +210,23 @@ $$\frac{1}{\pi} = 12 \sum_{k=0}^{\infty} \frac{(-1)^k (6k)! (545140134k + 135914
   * `mpmath` automatically detects and binds `mpmath.libmp.BACKEND == 'gmpy'`, delivering **10x–15x higher throughput** than pure Python.
   * Graceful fallback to pure Python `BACKEND == 'python'` if `gmpy2` is not present.
 * **Empirical Time Estimation & Inverse Time-Budget Engine**:
-  * Forward Scaling Law (1.65 exponent to model base-10 conversion overhead at 20M–50M+ digits):
-    $$T_{\text{est}} = T_{\text{last}} \times \left(\frac{\text{current\_total} + \text{chunk\_delta}}{N_{\text{last}}}\right)^{1.65}$$
+  * Forward Scaling Law (1.28 exponent to match compiled C `gmpy2` asymptotic scaling):
+    $$T_{\text{est}} = T_{\text{last}} \times \left(\frac{\text{current\_total} + \text{chunk\_delta}}{N_{\text{last}}}\right)^{1.28}$$
   * Inverse Scaling Law (`estimate_digits_for_time`):
-    $$N_{\text{target}} = \text{int}\left(N_{\text{last}} \times \left(\frac{T_{\text{budget}}}{T_{\text{last}}}\right)^{1 / 1.65}\right)$$
+    $$N_{\text{target}} = \text{int}\left(N_{\text{last}} \times \left(\frac{T_{\text{budget}}}{T_{\text{last}}}\right)^{1 / 1.28}\right)$$
     $$\Delta N = \max\left(100\_000, \text{round}\left(\frac{N_{\text{target}} - \text{current\_total}}{100\_000}\right) \times 100\_000\right)$$
+  * Initial calibration baseline set to $N_{\text{last}} = 100,000,000$ and $T_{\text{last}} = 92.0\text{s}$ under `gmpy2`, evaluating $+2,000,000$ block calculations to $\sim 95\text{s}$ ($\sim 2\text{ Mins}$) accurately on cold start.
+  * Measured benchmark metrics are persisted inside `data/pi_index.json` under `"benchmark"` across application sessions.
   * Step caps enforce $\Delta N \le 10,000,000$ digits for $\le 30\text{s}$ bursts and $\Delta N \le 20,000,000$ digits for $\le 60\text{s}$ bursts, preventing runaway jumps from fast benchmarks.
 
-### 3.2 Persistent Raw Stream (`data/pi_digits.txt`)
+### 3.2 Persistent Raw Stream & Delta Appending (`data/pi_digits.txt`)
 * **Format**: Plain ASCII text file containing contiguous decimal digits of $\pi$ directly following `3.`.
   * Index offset 0 in the file corresponds to 1-based decimal digit position 1 (`1` in `14159...`).
-* **Chunked Appending**: Newly computed digits are persisted and flushed upon completion of each step.
+* **Delta Slice Appending**: Subprocess calculations take `old_len`, write only the newly calculated $\sim 2\text{MB}$ delta slice to disk, and the main process appends directly via `"a"` mode, avoiding rewriting multi-hundred-megabyte streams.
 * **Zero Corruption Guarantee**: On application startup, the file length determines the starting baseline precision.
+* **Seed Pack Export & Import**:
+  * `export_seed(dest_path)` compresses the active cache into `.zst`, `.gz`, `.xz`, or `.txt` formats with metadata logging.
+  * `import_seed(src_path)` performs mathematical validation checking the standard prefix `1415926535` and all-digit integrity before updating `data/pi_digits.txt`, rebuilding indices, and syncing to external seed archives.
 
 ### 3.3 Boundary Stitch Logic, Safety Lookahead & Prefix Indexing
 1. **Boundary Overlap Guarantee**:

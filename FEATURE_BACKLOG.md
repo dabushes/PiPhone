@@ -64,6 +64,27 @@ This document outlines completed milestones, planned enhancements, architectural
   * Dynamic target typography (`26pt` for 1–6 digits, `22pt` for 7–8 digits, `19pt` for 9–10 digits) eliminating clipping.
   * Compact search history cards with top-right View button and full-width Line 2/Line 3 rows.
 
+### FB-12: Cold-Start 100M Time Calibration & Benchmark Persistence
+* **Status**: **Completed (v2.3)**
+* **Implementation**:
+  * Lowered empirical scaling exponent from `1.65` to `1.28` to match compiled C `gmpy2` asymptotic scaling.
+  * Initialized default calibration baseline to $N_{\text{last}} = 100,000,000$ digits and $T_{\text{last}} = 92.0\text{s}$, giving accurate $\sim 95\text{s}$ ($\sim 2\text{ Mins}$) initial estimates instead of 15 Mins.
+  * Persisted `(last_calc_digits, last_calc_time)` inside `data/pi_index.json` under `"benchmark"`, reloading dynamically across application cold restarts.
+
+### FB-13: Seed Pack Export & Import System
+* **Status**: **Completed (v2.3)**
+* **Implementation**:
+  * Implemented `export_seed(dest_path)` supporting `.zst`, `.gz`, `.xz`, and `.txt` compression with real-time UI feedback.
+  * Implemented `import_seed(src_path)` with strict ground-truth prefix validation (`1415926535`), full numeric validation, index rebuilding, and automatic synchronization to external seed archives.
+  * Added `📤 Export Seed` and `📥 Import Seed` buttons to the Search History tab banner card running asynchronously on background threads.
+
+### FB-14: Instant Progress Bar & IPC Slice Stream Optimization
+* **Status**: **Completed (v2.3)**
+* **Implementation**:
+  * Modal continuation triggers instant indeterminate progress bar activation and status updates on the main GUI thread before worker resumption.
+  * Subprocess calculation takes `old_len`, writing only the newly computed $\sim 2\text{MB}$ delta slice to disk and appending to `pi_digits.txt`, eliminating multi-hundred-megabyte IPC transfer bottlenecks.
+  * Cleaned telemetry status line to eliminate duplicate `"Calculating Pi... "` prefix and fit comfortably inside 390px.
+
 ---
 
 ## 2. Active Backlog Items

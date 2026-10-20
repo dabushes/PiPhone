@@ -1,7 +1,7 @@
 """
 PiPhone - Interactive Dark-Mode Pi Dialer & Decimal Expansion Search Engine
-Version 2.1: Visible Expandable Seed Archive, Mouse-Selectable Text Widgets (Ctrl+C),
-and T_min_step Dynamic Time-Budget Golden Rule.
+Version 2.3: Seed Export/Import, Calibrated 100M Time Estimates, Instant Progress Bar,
+and Unclipped Status Text.
 """
 
 from __future__ import annotations
@@ -549,7 +549,43 @@ class PiPhoneApp(ctk.CTk):
             font=ctk.CTkFont(size=15, weight="bold"),
             text_color="#00E5FF",
         )
-        self.lbl_cached_banner.pack(padx=12, pady=10)
+        self.lbl_cached_banner.pack(padx=12, pady=(10, 4))
+
+        # Seed Export & Import Action Buttons
+        seed_btn_frame = ctk.CTkFrame(self.banner_card, fg_color="transparent")
+        seed_btn_frame.pack(padx=12, pady=(2, 4))
+
+        self.btn_export_seed = ctk.CTkButton(
+            seed_btn_frame,
+            text="📤 Export Seed",
+            width=120,
+            height=28,
+            fg_color="#2E7D32",
+            hover_color="#1B5E20",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._export_seed_dialog,
+        )
+        self.btn_export_seed.pack(side="left", padx=4)
+
+        self.btn_import_seed = ctk.CTkButton(
+            seed_btn_frame,
+            text="📥 Import Seed",
+            width=120,
+            height=28,
+            fg_color="#0277BD",
+            hover_color="#01579B",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._import_seed_dialog,
+        )
+        self.btn_import_seed.pack(side="left", padx=4)
+
+        self.lbl_seed_status = ctk.CTkLabel(
+            self.banner_card,
+            text="",
+            font=ctk.CTkFont(size=11),
+            text_color="gray70",
+        )
+        self.lbl_seed_status.pack(padx=12, pady=(0, 6))
 
         # Scrollable log of searches
         self.history_list = ctk.CTkScrollableFrame(self.tab_history)
@@ -944,7 +980,7 @@ class PiPhoneApp(ctk.CTk):
                         self.lbl_telemetry.configure(text=status_msg)
                     else:
                         self.lbl_telemetry.configure(
-                            text=f"Calculating Pi... {digits_searched:,} digits searched ({elapsed:.1f}s elapsed)"
+                            text=f"{digits_searched:,} digits searched ({elapsed:.1f}s elapsed)"
                         )
                 elif msg_type == "checkpoint":
                     self.prog_bar.stop()
@@ -987,6 +1023,14 @@ class PiPhoneApp(ctk.CTk):
         """Opens the checkpoint pause modal with the 5-tier escalating schedule on the GUI thread."""
         def on_action(action: Any):
             response_holder["action"] = action
+            if action != "stop" and action is not None:
+                # Immediately show and start progress bar and set status on main GUI thread BEFORE worker resumes
+                self.prog_bar.grid()
+                self.prog_bar.start()
+                self.lbl_position.configure(text="Calculating Pi...")
+                self.lbl_telemetry.configure(text="Resuming calculation...")
+                self.lbl_status.configure(text="● Calculating...", text_color="#FFA000")
+                self.update()
             response_event.set()
             if action == "stop":
                 self._refresh_history_tab()
@@ -999,6 +1043,129 @@ class PiPhoneApp(ctk.CTk):
             on_action,
             query=query,
         )
+
+    def _export_seed_dialog(self):
+        """Opens file save dialog and exports compressed Pi seed pack in a background thread."""
+        if self._is_searching:
+            return
+
+        from tkinter import filedialog, messagebox
+
+        dest_file = filedialog.asksaveasfilename(
+            parent=self,
+            title="Export Pi Seed Pack",
+            initialfile="pi_seed.zst",
+            defaultextension=".zst",
+            filetypes=[
+                ("Zstandard Archive (*.zst)", "*.zst"),
+                ("Gzip Archive (*.gz)", "*.gz"),
+                ("Text File (*.txt)", "*.txt"),
+                ("All Files (*.*)", "*.*"),
+            ],
+        )
+        if not dest_file:
+            return
+
+        self.btn_export_seed.configure(state="disabled")
+        self.btn_import_seed.configure(state="disabled")
+        self.lbl_seed_status.configure(text="Compressing and exporting seed...", text_color="#FFA000")
+
+        def worker():
+            try:
+                def prog(msg: str):
+                    self.after(0, lambda: self.lbl_seed_status.configure(text=msg))
+
+                meta = self.engine.export_seed(dest_file, progress_callback=prog)
+                size_mb = meta["bytes"] / (1024 * 1024)
+                success_text = f"Exported {meta['digits_count']:,} digits ({size_mb:.1f} MB)"
+
+                def on_done():
+                    self.lbl_seed_status.configure(text=success_text, text_color="#4CAF50")
+                    self.btn_export_seed.configure(state="normal")
+                    self.btn_import_seed.configure(state="normal")
+                    messagebox.showinfo(
+                        "Export Complete",
+                        f"Successfully exported {meta['digits_count']:,} digits to:\n{dest_file}",
+                        parent=self,
+                    )
+
+                self.after(0, on_done)
+            except Exception as e:
+                err_text = str(e)
+                def on_err():
+                    self.lbl_seed_status.configure(text=f"Export failed: {err_text}", text_color="#EF5350")
+                    self.btn_export_seed.configure(state="normal")
+                    self.btn_import_seed.configure(state="normal")
+                    messagebox.showerror("Export Error", f"Failed to export seed:\n{err_text}", parent=self)
+
+                self.after(0, on_err)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _import_seed_dialog(self):
+        """Opens file open dialog and imports a Pi seed pack in a background thread."""
+        if self._is_searching:
+            return
+
+        from tkinter import filedialog, messagebox
+
+        src_file = filedialog.askopenfilename(
+            parent=self,
+            title="Import Pi Seed Pack",
+            filetypes=[
+                ("Pi Seed Archives (*.zst;*.gz;*.xz;*.txt)", "*.zst;*.gz;*.xz;*.txt"),
+                ("Zstandard Archive (*.zst)", "*.zst"),
+                ("Gzip Archive (*.gz)", "*.gz"),
+                ("LZMA Archive (*.xz)", "*.xz"),
+                ("Text File (*.txt)", "*.txt"),
+                ("All Files (*.*)", "*.*"),
+            ],
+        )
+        if not src_file:
+            return
+
+        if not messagebox.askyesno(
+            "Confirm Seed Import",
+            "Importing this seed will replace your current cached digits of Pi with the imported seed.\n\nDo you want to proceed?",
+            parent=self,
+        ):
+            return
+
+        self.btn_export_seed.configure(state="disabled")
+        self.btn_import_seed.configure(state="disabled")
+        self.lbl_seed_status.configure(text="Reading and decompressing seed...", text_color="#FFA000")
+
+        def worker():
+            try:
+                def prog(msg: str):
+                    self.after(0, lambda: self.lbl_seed_status.configure(text=msg))
+
+                count = self.engine.import_seed(src_file, progress_callback=prog)
+                success_text = f"Imported {count:,} digits successfully!"
+
+                def on_done():
+                    self.lbl_seed_status.configure(text=success_text, text_color="#4CAF50")
+                    self.btn_export_seed.configure(state="normal")
+                    self.btn_import_seed.configure(state="normal")
+                    self._refresh_history_tab()
+                    messagebox.showinfo(
+                        "Import Complete",
+                        f"Successfully imported {count:,} digits from:\n{src_file}",
+                        parent=self,
+                    )
+
+                self.after(0, on_done)
+            except Exception as e:
+                err_text = str(e)
+                def on_err():
+                    self.lbl_seed_status.configure(text=f"Import failed: {err_text}", text_color="#EF5350")
+                    self.btn_export_seed.configure(state="normal")
+                    self.btn_import_seed.configure(state="normal")
+                    messagebox.showerror("Import Error", f"Failed to import seed:\n{err_text}", parent=self)
+
+                self.after(0, on_err)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_search_completed(self, result: SearchResult):
         """Updates the dialer UI and history tab when a match is found."""

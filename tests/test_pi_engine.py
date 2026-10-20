@@ -384,8 +384,8 @@ def test_tc12_empirical_time_estimation_scaling(tmp_path: Path):
     est_delta_1m = engine.estimate_chunk_time(100_000, 1_000_000)
     assert est_delta_50k < est_delta_100k < est_delta_1m
 
-    # Mathematical precision of scaling law: T_est = 0.10 * (200k / 100k)^1.65
-    expected_2x = 0.10 * (2.0 ** 1.65)
+    # Mathematical precision of scaling law: T_est = 0.10 * (200k / 100k)^1.28
+    expected_2x = 0.10 * (2.0 ** 1.28)
     assert abs(est_100k_total - expected_2x) < 0.001
 
     # Format helpers
@@ -481,8 +481,8 @@ def test_tc15_5_tier_checkpoint_schedule(tmp_path: Path):
 
     # --- Tier 2 (15s <= T_min_step < 24s) ---
     engine.last_calc_digits = 1_000_000
-    engine.last_calc_time = 3.2
-    # current_total = 1_000_000, +2M -> target 3M -> 3.2 * 3^1.65 ~ 19.6s (15 <= t < 24)
+    engine.last_calc_time = 4.5
+    # current_total = 1_000_000, +2M -> target 3M -> 4.5 * 3^1.28 ~ 18.36s (15 <= t < 24)
     cfg2 = engine.get_checkpoint_tier_config(1_000_000)
     assert cfg2.tier == 2
     assert "Continue (+1,000,000" in cfg2.option1.label
@@ -495,8 +495,8 @@ def test_tc15_5_tier_checkpoint_schedule(tmp_path: Path):
 
     # --- Tier 3 (24s <= T_min_step < 48s) ---
     engine.last_calc_digits = 1_000_000
-    engine.last_calc_time = 5.5
-    # current_total = 1_000_000, +2M -> target 3M -> 5.5 * 3^1.65 ~ 33.7s (24 <= t < 48)
+    engine.last_calc_time = 7.0
+    # current_total = 1_000_000, +2M -> target 3M -> 7.0 * 3^1.28 ~ 28.57s (24 <= t < 48)
     cfg3 = engine.get_checkpoint_tier_config(1_000_000)
     assert cfg3.tier == 3
     assert "Continue (+1,000,000" not in cfg3.option1.label
@@ -510,8 +510,8 @@ def test_tc15_5_tier_checkpoint_schedule(tmp_path: Path):
 
     # --- Tier 4 (48s <= T_min_step <= 90s) ---
     engine.last_calc_digits = 1_000_000
-    engine.last_calc_time = 11.0
-    # current_total = 1_000_000, +2M -> target 3M -> 11.0 * 3^1.65 ~ 67.4s (48 <= t <= 90)
+    engine.last_calc_time = 14.0
+    # current_total = 1_000_000, +2M -> target 3M -> 14.0 * 3^1.28 ~ 57.13s (48 <= t <= 90)
     cfg4 = engine.get_checkpoint_tier_config(1_000_000)
     assert cfg4.tier == 4
     assert "Search for 2 Minutes" in cfg4.option1.label
@@ -524,8 +524,8 @@ def test_tc15_5_tier_checkpoint_schedule(tmp_path: Path):
 
     # --- Tier 5 (T_min_step > 90s) ---
     engine.last_calc_digits = 1_000_000
-    engine.last_calc_time = 20.0
-    # current_total = 1_000_000, +2M -> target 3M -> 20.0 * 3^1.65 ~ 122.6s (> 90s)
+    engine.last_calc_time = 25.0
+    # current_total = 1_000_000, +2M -> target 3M -> 25.0 * 3^1.28 ~ 102.0s (> 90s)
     cfg5 = engine.get_checkpoint_tier_config(1_000_000)
     assert cfg5.tier == 5
     assert "Calculate Next Block" in cfg5.option1.label
@@ -681,10 +681,10 @@ def test_tc18_t_min_step_golden_rule_enforcement(tmp_path: Path):
 
     for simulated_t_min_step, expected_tier in test_steps:
         # At current_total = 1_000_000, target for +2M is 3_000_000 -> ratio = 3.0
-        # t_min_step = t_last * (3.0 ** 1.65)
-        # So t_last = simulated_t_min_step / (3.0 ** 1.65)
+        # t_min_step = t_last * (3.0 ** 1.28)
+        # So t_last = simulated_t_min_step / (3.0 ** 1.28)
         engine.last_calc_digits = 1_000_000
-        engine.last_calc_time = simulated_t_min_step / (3.0 ** 1.65)
+        engine.last_calc_time = simulated_t_min_step / (3.0 ** 1.28)
 
         cfg = engine.get_checkpoint_tier_config(1_000_000)
         assert cfg.tier == expected_tier
@@ -924,3 +924,95 @@ def test_tc25_instant_calculation_cancellation(tmp_path: Path):
 
     assert result is None
     assert elapsed < 0.50  # Must terminate and return in under 0.50s
+
+
+# =====================================================================
+# TC-26: Cold-Start Time Estimate Calibration at 100M Digits & Persistence
+# =====================================================================
+def test_tc26_cold_start_100m_time_calibration(tmp_path: Path):
+    """
+    TC-26: Verify that:
+    1. Cold start benchmark default at 100M digits evaluates to ~95s (~2 Mins)
+       instead of ~15 Mins.
+    2. get_checkpoint_tier_config(100_000_000) provides '~2 Mins' option.
+    3. Benchmark measurements (last_calc_digits, last_calc_time) are persisted
+       in pi_index.json and reloaded across engine restarts.
+    """
+    engine = PiEngine(data_dir=tmp_path, default_seed_digits=1000, load_seed_pack=False)
+    # Ensure baseline gmpy2 calibration: 100M digits / 92.0s
+    engine.last_calc_digits = 100_000_000
+    engine.last_calc_time = 92.0
+
+    est_next_block = engine.estimate_chunk_time(100_000_000, 2_000_000)
+    # 92.0 * (102M / 100M)^1.28 ~ 94.4s -> within 60s to 120s
+    assert 60.0 <= est_next_block <= 120.0
+
+    tier_cfg = engine.get_checkpoint_tier_config(100_000_000)
+    assert tier_cfg.tier == 5
+    assert "~2 Mins" in tier_cfg.option1.label
+
+    # Verify persistence in pi_index.json
+    engine.last_calc_digits = 105_000_000
+    engine.last_calc_time = 101.5
+    engine._save_index()
+
+    # Cold start in same directory
+    engine2 = PiEngine(data_dir=tmp_path, default_seed_digits=0, load_seed_pack=False)
+    assert engine2.last_calc_digits == 105_000_000
+    assert abs(engine2.last_calc_time - 101.5) < 0.001
+    assert engine2.has_calibrated_benchmark is True
+
+
+# =====================================================================
+# TC-27: Seed Export and Import Round-Trip & Validation
+# =====================================================================
+def test_tc27_seed_export_import_roundtrip(tmp_path: Path):
+    """
+    TC-27: Verify export_seed() compresses digits into .zst/.gz/.txt,
+    import_seed() validates the standard stream starting with '1415926535',
+    replaces cached digits, updates indices, and rejects malformed seed files.
+    """
+    # Create engine with 50,000 digits
+    src_data = tmp_path / "src_data"
+    engine1 = PiEngine(data_dir=src_data, default_seed_digits=50_000, load_seed_pack=False)
+    assert engine1.get_total_cached_digits() == 50_000
+
+    # 1. Export as .zst
+    export_zst = tmp_path / "exported_pi.zst"
+    meta_zst = engine1.export_seed(export_zst)
+    assert meta_zst["digits_count"] == 50_000
+    assert Path(meta_zst["path"]).exists()
+    assert meta_zst["bytes"] > 0
+
+    # 2. Export as .txt
+    export_txt = tmp_path / "exported_pi.txt"
+    meta_txt = engine1.export_seed(export_txt)
+    assert meta_txt["digits_count"] == 50_000
+    assert meta_txt["bytes"] == 50_000
+
+    # 3. Import into a fresh engine
+    dest_data = tmp_path / "dest_data"
+    engine2 = PiEngine(data_dir=dest_data, default_seed_digits=1000, load_seed_pack=False)
+    assert engine2.get_total_cached_digits() == 1000
+
+    imported_count = engine2.import_seed(export_zst)
+    assert imported_count == 50_000
+    assert engine2.get_total_cached_digits() == 50_000
+    assert engine2.digits == engine1.digits
+
+    # Verify search succeeds in imported engine
+    res = engine2.search("1415")
+    assert res is not None
+    assert res.position == 1
+
+    # 4. Reject invalid seed: wrong prefix
+    bad_prefix = tmp_path / "bad_prefix.txt"
+    bad_prefix.write_text("99999999991234567890", encoding="ascii")
+    with pytest.raises(ValueError, match="does not start with standard Pi digits"):
+        engine2.import_seed(bad_prefix)
+
+    # 5. Reject invalid seed: non-numeric characters
+    bad_chars = tmp_path / "bad_chars.txt"
+    bad_chars.write_text("1415926535abcdefg", encoding="ascii")
+    with pytest.raises(ValueError, match="contains non-numeric"):
+        engine2.import_seed(bad_chars)

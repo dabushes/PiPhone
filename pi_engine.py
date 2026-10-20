@@ -251,36 +251,41 @@ def compute_pi_digits(total_digits: int, guard_digits: int = 20) -> str:
     return decimals
 
 
-def _compute_pi_worker(target_len: int, temp_file_path: str, result_queue: Any) -> None:
+def _compute_pi_worker(target_len: int, temp_file_path: str, result_queue: Any, old_len: int = 0) -> None:
     """Worker process entry point for out-of-process Pi digit calculation."""
     try:
         digits = compute_pi_digits(target_len)
+        slice_to_write = digits[old_len:] if old_len > 0 else digits
         with open(temp_file_path, "w", encoding="ascii") as f:
-            f.write(digits)
-        result_queue.put({"success": True, "len": len(digits)})
+            f.write(slice_to_write)
+        result_queue.put({"success": True, "len": len(slice_to_write), "full_len": len(digits)})
     except Exception as e:
         result_queue.put({"success": False, "error": str(e)})
 
 
 def compute_pi_digits_cancellable(
     target_len: int,
+    old_len: int = 0,
     cancel_event: Optional[threading.Event] = None,
     poll_interval: float = 0.05,
     temp_dir: Optional[Path] = None,
 ) -> Optional[str]:
     """
     Computes target_len decimal digits of Pi inside a dedicated child process.
+    If old_len > 0, returns only the newly calculated slice decimals[old_len:target_len]
+    (~2MB) to eliminate massive multi-hundred megabyte IPC and memory bottlenecks.
     Allows instantaneous cancellation (< 0.05s) via process.terminate() if
     cancel_event is set during computation.
     """
-    if target_len <= 0:
+    if target_len <= 0 or target_len <= old_len:
         return ""
 
     # If no cancel_event is provided or target_len is small (< 100k), calculate directly in process
     if cancel_event is None or target_len <= 100_000:
         if cancel_event is not None and cancel_event.is_set():
             return None
-        return compute_pi_digits(target_len)
+        res = compute_pi_digits(target_len)
+        return res[old_len:] if old_len > 0 else res
 
     import multiprocessing as mp
     import uuid
@@ -295,7 +300,7 @@ def compute_pi_digits_cancellable(
 
     p = ctx.Process(
         target=_compute_pi_worker,
-        args=(target_len, str(temp_file), result_queue),
+        args=(target_len, str(temp_file), result_queue, old_len),
         daemon=True,
     )
 
@@ -337,9 +342,11 @@ def compute_pi_digits_cancellable(
         if not result_queue.empty():
             res = result_queue.get_nowait()
             if not res.get("success", False):
-                return compute_pi_digits(target_len)
+                full = compute_pi_digits(target_len)
+                return full[old_len:] if old_len > 0 else full
 
-        return compute_pi_digits(target_len)
+        full = compute_pi_digits(target_len)
+        return full[old_len:] if old_len > 0 else full
 
     except Exception:
         if p.is_alive():
@@ -349,7 +356,8 @@ def compute_pi_digits_cancellable(
                 pass
         if cancel_event is not None and cancel_event.is_set():
             return None
-        return compute_pi_digits(target_len)
+        full = compute_pi_digits(target_len)
+        return full[old_len:] if old_len > 0 else full
 
 
 def format_delta_digits(delta: int) -> str:
@@ -443,23 +451,24 @@ class PiEngine:
         self.prefix_index: list[tuple[str, int]] = []
 
         # Empirical calculation benchmark tracking
-        self.has_calibrated_benchmark: bool = False
         if BACKEND_NAME == "gmpy":
-            self.last_calc_digits: int = 100_000
-            self.last_calc_time: float = 0.05
+            self.last_calc_digits: int = 100_000_000
+            self.last_calc_time: float = 92.0
+            self.has_calibrated_benchmark: bool = True
         else:
-            self.last_calc_digits: int = 100_000
-            self.last_calc_time: float = 0.35
+            self.last_calc_digits = 100_000
+            self.last_calc_time = 0.35
+            self.has_calibrated_benchmark = False
 
         self._load_state(default_seed_digits)
 
     def calibrate_benchmark(self, force: bool = False) -> None:
         """
         Runs a quick micro-benchmark (calculating 500,000 digits in memory)
-        to calibrate N_last and T_last to the exact host CPU performance,
-        without modifying or overwriting self.digits or disk files.
+        to calibrate N_last and T_last when starting with small or uncalibrated caches.
+        Does not overwrite deep calibrations (>= 10,000,000 digits) unless forced.
         """
-        if self.has_calibrated_benchmark and not force:
+        if (self.has_calibrated_benchmark or self.last_calc_digits >= 10_000_000) and not force:
             return
 
         bench_digits = 500_000
@@ -507,6 +516,105 @@ class PiEngine:
         t = threading.Thread(target=self.sync_seed_file, daemon=True)
         self._sync_seed_thread = t
         t.start()
+
+    def export_seed(
+        self,
+        dest_path: str | Path,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> dict[str, Any]:
+        """
+        Exports the currently cached Pi digits to dest_path.
+        Supports:
+        - .zst (Zstandard compression)
+        - .gz / .txt.gz (Gzip compression)
+        - .xz (LZMA compression)
+        - .txt (raw ASCII digits)
+        Returns metadata dict: {'digits_count': int, 'path': str, 'bytes': int}.
+        """
+        dest = Path(dest_path).resolve()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        with self._lock:
+            digits_to_export = self.digits
+
+        if not digits_to_export:
+            raise ValueError("Cannot export empty Pi digits cache.")
+
+        if progress_callback:
+            progress_callback("Compressing seed file...")
+
+        name_lower = dest.name.lower()
+        if name_lower.endswith((".zst", ".xz", ".gz")):
+            compress_seed_file(digits_to_export, dest)
+        else:
+            import uuid
+            temp_dest = dest.parent / f"{dest.name}.{uuid.uuid4().hex}.tmp"
+            with open(temp_dest, "w", encoding="ascii") as f:
+                f.write(digits_to_export)
+            temp_dest.replace(dest)
+
+        file_size = dest.stat().st_size
+        return {
+            "digits_count": len(digits_to_export),
+            "path": str(dest),
+            "bytes": file_size,
+        }
+
+    def import_seed(
+        self,
+        src_path: str | Path,
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ) -> int:
+        """
+        Imports and validates a seed file (.zst, .xz, .gz, or .txt).
+        Validates that:
+        1. File exists.
+        2. Stream starts with standard Pi sequence '1415926535' (first 10 decimal digits).
+        3. Stream contains numeric digits only.
+        Writes stream to self.digits_file, updates self.digits, resets query cache,
+        persists state, and syncs external seed archive if running frozen.
+        Returns the total digit count imported.
+        """
+        src = Path(src_path).resolve()
+        if not src.exists():
+            raise FileNotFoundError(f"Seed file not found: {src}")
+
+        if progress_callback:
+            progress_callback("Decompressing seed file...")
+
+        name_lower = src.name.lower()
+        if name_lower.endswith((".zst", ".xz", ".gz")):
+            imported_digits = decompress_seed_file(src)
+        else:
+            with open(src, "r", encoding="ascii") as f:
+                imported_digits = f.read().strip()
+
+        if progress_callback:
+            progress_callback("Validating Pi sequence...")
+
+        if not imported_digits.startswith("1415926535"):
+            raise ValueError("Invalid seed file: does not start with standard Pi digits ('1415926535').")
+
+        if not imported_digits.isdigit():
+            raise ValueError("Invalid seed file: contains non-numeric characters.")
+
+        digit_count = len(imported_digits)
+
+        if progress_callback:
+            progress_callback("Saving imported digits...")
+
+        with self._lock:
+            self.digits = imported_digits
+            with open(self.digits_file, "w", encoding="ascii") as f:
+                f.write(self.digits)
+
+            self.query_cache.clear()
+            self.prefix_index.clear()
+            self._sort_indices()
+            self._save_index()
+
+        self._sync_seed_in_background()
+        return digit_count
 
     def _load_state(self, default_seed_digits: int) -> None:
         """Loads cached digits and sorted indices from disk, extracts bundled seed, or seeds initial digits."""
@@ -562,6 +670,12 @@ class PiEngine:
                     data = json.load(f)
                     self.query_cache = [tuple(item) for item in data.get("query_cache", [])]
                     self.prefix_index = [tuple(item) for item in data.get("prefix_index", [])]
+                    bench = data.get("benchmark")
+                    if isinstance(bench, dict):
+                        if "last_calc_digits" in bench and "last_calc_time" in bench:
+                            self.last_calc_digits = int(bench["last_calc_digits"])
+                            self.last_calc_time = float(bench["last_calc_time"])
+                            self.has_calibrated_benchmark = True
             except Exception:
                 self.query_cache = []
                 self.prefix_index = []
@@ -575,10 +689,14 @@ class PiEngine:
         self.prefix_index.sort(key=lambda x: x[0])
 
     def _save_index(self) -> None:
-        """Saves sorted query cache to disk."""
+        """Saves sorted query cache and benchmark metrics to disk."""
         data = {
             "query_cache": self.query_cache,
             "prefix_index": self.prefix_index,
+            "benchmark": {
+                "last_calc_digits": self.last_calc_digits,
+                "last_calc_time": self.last_calc_time,
+            },
         }
         with open(self.index_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -650,7 +768,7 @@ class PiEngine:
         Estimates the wall-clock compute duration (in seconds) to expand Pi from
         current_total to (current_total + chunk_delta) digits using the empirical
         super-linear scaling law:
-            T_est = T_last * ((current_total + chunk_delta) / N_last) ** 1.35
+            T_est = T_last * ((current_total + chunk_delta) / N_last) ** 1.28
 
         Args:
             current_total: Number of decimal digits currently calculated.
@@ -663,7 +781,7 @@ class PiEngine:
             return 0.05
         target = current_total + chunk_delta
         ratio = max(0.001, target / self.last_calc_digits)
-        return float(self.last_calc_time * (ratio ** 1.65))
+        return float(self.last_calc_time * (ratio ** 1.28))
 
     @staticmethod
     def format_estimated_time(seconds: float) -> str:
@@ -710,7 +828,7 @@ class PiEngine:
         """
         Calculates the number of incremental digits Delta N that can be computed
         within a target time budget (target_seconds) based on the inverse scaling law:
-            N_target = int(N_last * (target_seconds / T_last) ** (1 / 1.65))
+            N_target = int(N_last * (target_seconds / T_last) ** (1 / 1.28))
             Delta N = max(min_floor, round((N_target - current_total) / 100_000) * 100_000)
         Enforces min_floor (default 100,000) and max_cap (default 25,000,000).
 
@@ -730,7 +848,7 @@ class PiEngine:
         t_last = max(0.001, self.last_calc_time)
 
         ratio = target_seconds / t_last
-        n_target = int(n_last * (ratio ** (1.0 / 1.65)))
+        n_target = int(n_last * (ratio ** (1.0 / 1.28)))
         raw_delta = n_target - current_total
 
         # Round to nearest 100,000 with minimum floor
@@ -772,8 +890,8 @@ class PiEngine:
         Returns:
             CheckpointTierConfig with configured options and metadata.
         """
-        # Ensure CPU benchmark is calibrated if dealing with deep caches
-        if current_total >= 10_000_000 and not self.has_calibrated_benchmark:
+        # Ensure CPU benchmark is calibrated if dealing with deep caches without baseline
+        if current_total >= 10_000_000 and not self.has_calibrated_benchmark and self.last_calc_digits < 10_000_000:
             self.calibrate_benchmark()
 
         t_min_step = self.estimate_chunk_time(current_total, 2_000_000)
@@ -1077,19 +1195,25 @@ class PiEngine:
                     target_len = old_total + delta_n
 
                     t_calc_start = time.perf_counter()
-                    new_digits = compute_pi_digits_cancellable(target_len, cancel_event=cancel_event, temp_dir=self.data_dir)
-                    if new_digits is None:
+                    new_slice = compute_pi_digits_cancellable(
+                        target_len,
+                        old_len=old_total,
+                        cancel_event=cancel_event,
+                        temp_dir=self.data_dir,
+                    )
+                    if new_slice is None:
                         return None
                     calc_duration = time.perf_counter() - t_calc_start
 
                     self.last_calc_digits = target_len
                     self.last_calc_time = max(0.001, calc_duration)
-                    new_digits_total += (len(new_digits) - old_total)
+                    new_digits_total += len(new_slice)
 
                     with self._lock:
-                        self.digits = new_digits
-                        with open(self.digits_file, "w", encoding="ascii") as f:
-                            f.write(self.digits)
+                        self.digits += new_slice
+                        with open(self.digits_file, "a", encoding="ascii") as f:
+                            f.write(new_slice)
+                        self._save_index()
                     self._sync_seed_in_background()
 
                     cur_elapsed = time.perf_counter() - start_burst
@@ -1128,19 +1252,25 @@ class PiEngine:
                 target_len = old_total + step_delta
 
                 t_calc_start = time.perf_counter()
-                new_digits = compute_pi_digits_cancellable(target_len, cancel_event=cancel_event, temp_dir=self.data_dir)
-                if new_digits is None:
+                new_slice = compute_pi_digits_cancellable(
+                    target_len,
+                    old_len=old_total,
+                    cancel_event=cancel_event,
+                    temp_dir=self.data_dir,
+                )
+                if new_slice is None:
                     return None
                 calc_duration = time.perf_counter() - t_calc_start
 
                 self.last_calc_digits = target_len
                 self.last_calc_time = max(0.001, calc_duration)
-                new_digits_total += (len(new_digits) - old_total)
+                new_digits_total += len(new_slice)
 
                 with self._lock:
-                    self.digits = new_digits
-                    with open(self.digits_file, "w", encoding="ascii") as f:
-                        f.write(self.digits)
+                    self.digits += new_slice
+                    with open(self.digits_file, "a", encoding="ascii") as f:
+                        f.write(new_slice)
+                    self._save_index()
                 self._sync_seed_in_background()
 
                 report_progress(len(self.digits), time.perf_counter() - start_time)
@@ -1195,17 +1325,24 @@ class PiEngine:
 
     def _expand_to_length(self, target_len: int, cancel_event: Optional[threading.Event] = None) -> None:
         """Expands self.digits to at least target_len digits and saves to disk."""
-        if len(self.digits) < target_len:
+        old_total = len(self.digits)
+        if old_total < target_len:
             with self._lock:
                 t_calc_start = time.perf_counter()
-                new_d = compute_pi_digits_cancellable(target_len, cancel_event=cancel_event, temp_dir=self.data_dir)
-                if new_d is not None:
-                    self.digits = new_d
+                new_slice = compute_pi_digits_cancellable(
+                    target_len,
+                    old_len=old_total,
+                    cancel_event=cancel_event,
+                    temp_dir=self.data_dir,
+                )
+                if new_slice is not None:
+                    self.digits += new_slice
                     calc_duration = time.perf_counter() - t_calc_start
                     self.last_calc_digits = target_len
                     self.last_calc_time = max(0.001, calc_duration)
-                    with open(self.digits_file, "w", encoding="ascii") as f:
-                        f.write(self.digits)
+                    with open(self.digits_file, "a", encoding="ascii") as f:
+                        f.write(new_slice)
+                    self._save_index()
             self._sync_seed_in_background()
 
     def log_history(self, result: SearchResult) -> None:
