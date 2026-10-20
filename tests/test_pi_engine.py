@@ -27,7 +27,7 @@ from pi_engine import (
 def temp_engine(tmp_path: Path) -> PiEngine:
     """Fixture providing a fresh PiEngine instance backed by a temporary directory."""
     # Seed with 10,000 digits to allow fast local testing without network/heavy math
-    return PiEngine(data_dir=tmp_path, default_seed_digits=10_000)
+    return PiEngine(data_dir=tmp_path, default_seed_digits=10_000, load_seed_pack=False)
 
 
 # =====================================================================
@@ -710,16 +710,23 @@ def test_tc18_t_min_step_golden_rule_enforcement(tmp_path: Path):
 def test_tc19_seed_extraction_and_landmarks(tmp_path: Path):
     """
     TC-19: Verify seed decompression logic and assert that when the 100M seed
-    is loaded, landmarks 6411415 and 6434099 are resolved instantaneously (< 0.1s)
-    at positions 23,018,978 and 35,047,512 respectively.
+    is loaded, landmarks 6411415 and 6434099 are resolved instantaneously (< 0.15s)
+    at positions 23,018,978 and 35,047,512 respectively without calculating new digits.
+    Also verifies that an outdated partial cache is automatically upgraded to 100M digits.
     """
     seed_path = get_seed_path()
     assert seed_path is not None, "Bundled 100M seed archive must exist in seed/ directory."
     assert seed_path.exists()
 
-    # Initialize engine in isolated tmp_path with load_seed_pack=True
+    # Case A: Partial cache (< 100,000,000 digits) exists from previous run
+    partial_file = tmp_path / "pi_digits.txt"
+    partial_file.write_text("1415926535" * 1000, encoding="ascii")  # 10,000 digits
+    assert partial_file.stat().st_size == 10_000
+
+    # Initialize engine in tmp_path with load_seed_pack=True -> must auto-upgrade to 100M
     engine = PiEngine(data_dir=tmp_path, default_seed_digits=0, load_seed_pack=True)
     assert engine.get_total_cached_digits() == 100_000_000
+    assert partial_file.stat().st_size == 100_000_000
 
     # Search for landmark 1: 6411415 -> pos 23,018,978
     t0 = time.perf_counter()
@@ -727,7 +734,9 @@ def test_tc19_seed_extraction_and_landmarks(tmp_path: Path):
     elapsed1 = time.perf_counter() - t0
     assert res1 is not None
     assert res1.position == 23_018_978
-    assert elapsed1 < 0.15  # Instantaneous cache lookup
+    assert res1.source == "Sorted Index Cache"
+    assert res1.new_digits_calculated == 0
+    assert elapsed1 < 0.20  # Instantaneous cache lookup
 
     # Search for landmark 2: 6434099 -> pos 35,047,512
     t0 = time.perf_counter()
@@ -735,7 +744,9 @@ def test_tc19_seed_extraction_and_landmarks(tmp_path: Path):
     elapsed2 = time.perf_counter() - t0
     assert res2 is not None
     assert res2.position == 35_047_512
-    assert elapsed2 < 0.15  # Instantaneous cache lookup
+    assert res2.source == "Sorted Index Cache"
+    assert res2.new_digits_calculated == 0
+    assert elapsed2 < 0.20  # Instantaneous cache lookup
 
 
 # =====================================================================

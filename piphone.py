@@ -172,7 +172,7 @@ class PiPhoneApp(ctk.CTk):
         self.minsize(400, 680)
 
         # Core engine & concurrency
-        self.engine = PiEngine(data_dir="data", default_seed_digits=100_000)
+        self.engine = PiEngine(data_dir="data", default_seed_digits=100_000_000, load_seed_pack=True)
         self._search_thread: Optional[threading.Thread] = None
         self._cancel_event = threading.Event()
         self._msg_queue: queue.Queue = queue.Queue()

@@ -49,18 +49,26 @@ def get_app_dir() -> Path:
 
 def get_seed_path() -> Optional[Path]:
     """
-    Locates the bundled 100M seed file in PyInstaller temp dir or project seed/ dir.
+    Locates the bundled 100M seed file.
+    When running in PyInstaller frozen bundle, sys._MEIPASS is checked first.
+    Falls back to sys.executable directory and __file__ directory.
     Supports .zst, .xz, and .gz extensions.
     """
     search_dirs: list[Path] = []
-    # 1. PyInstaller frozen unpacked bundle dir
+    # 1. PyInstaller frozen unpacked bundle dir (_MEIPASS)
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        search_dirs.append(Path(sys._MEIPASS) / "seed")
-        search_dirs.append(Path(sys._MEIPASS))
-    # 2. Executable root or script root
-    app_dir = get_app_dir()
-    search_dirs.append(app_dir / "seed")
-    search_dirs.append(app_dir)
+        meipass_dir = Path(sys._MEIPASS).resolve()
+        search_dirs.append(meipass_dir / "seed")
+        search_dirs.append(meipass_dir)
+    # 2. Executable root directory (next to .exe)
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        search_dirs.append(exe_dir / "seed")
+        search_dirs.append(exe_dir)
+    # 3. Source script root directory (dev mode)
+    script_dir = Path(__file__).resolve().parent
+    search_dirs.append(script_dir / "seed")
+    search_dirs.append(script_dir)
 
     for d in search_dirs:
         for fname in ["pi_100m.zst", "pi_100m.xz", "pi_100m.gz", "pi_100m.txt.gz"]:
@@ -234,23 +242,25 @@ class PiEngine:
     def __init__(
         self,
         data_dir: str | Path | None = None,
-        default_seed_digits: int = 10_000,
+        default_seed_digits: int = 100_000_000,
         load_seed_pack: Optional[bool] = None,
     ):
         if data_dir is None:
             self.data_dir = get_app_dir() / "data"
-            is_production_default = True
         else:
             p = Path(data_dir)
             if p.is_absolute():
                 self.data_dir = p
             else:
                 self.data_dir = get_app_dir() / p
-            is_production_default = False
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
         if load_seed_pack is None:
-            self._should_load_seed = is_production_default or (default_seed_digits >= 100_000_000)
+            # Load seed pack by default in production or whenever data_dir is standard data/
+            if data_dir is None or str(data_dir).rstrip("/\\") in ("data", str(get_app_dir() / "data")):
+                self._should_load_seed = True
+            else:
+                self._should_load_seed = (default_seed_digits >= 100_000_000)
         else:
             self._should_load_seed = load_seed_pack
 
@@ -296,12 +306,23 @@ class PiEngine:
 
     def _load_state(self, default_seed_digits: int) -> None:
         """Loads cached digits and sorted indices from disk, extracts bundled seed, or seeds initial digits."""
+        # Check if digits_file exists and is full 100M
+        file_needs_seed = True
         if self.digits_file.exists():
-            with open(self.digits_file, "r", encoding="ascii") as f:
-                self.digits = f.read().strip()
+            try:
+                file_size = self.digits_file.stat().st_size
+                if file_size >= 100_000_000:
+                    file_needs_seed = False
+                    with open(self.digits_file, "r", encoding="ascii") as f:
+                        self.digits = f.read().strip()
+                else:
+                    # File exists but is smaller than 100M (e.g. outdated/partial cache)
+                    file_needs_seed = True
+            except Exception:
+                file_needs_seed = True
 
-        # Extract bundled 100M seed if available and enabled
-        if len(self.digits) < 100_000_000 and self._should_load_seed:
+        # Extract bundled 100M seed if file is missing or smaller than 100M
+        if file_needs_seed and self._should_load_seed:
             seed_path = get_seed_path()
             if seed_path is not None:
                 try:
@@ -310,10 +331,19 @@ class PiEngine:
                         self.digits = seed_digits
                         with open(self.digits_file, "w", encoding="ascii") as f:
                             f.write(self.digits)
+                        file_needs_seed = False
                 except Exception:
                     pass
 
-        # Seed initial digits if empty and requested
+        # If file existed and seed was not loaded (or disabled), load whatever was in file
+        if file_needs_seed and not self.digits and self.digits_file.exists():
+            try:
+                with open(self.digits_file, "r", encoding="ascii") as f:
+                    self.digits = f.read().strip()
+            except Exception:
+                pass
+
+        # Seed initial digits if empty and requested (fallback)
         if len(self.digits) < default_seed_digits and default_seed_digits > 0:
             initial = compute_pi_digits(default_seed_digits)
             self.digits = initial
