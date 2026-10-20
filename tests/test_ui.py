@@ -84,3 +84,4 @@ def test_key_press_ctrl_bypass():
     mock_app._on_primary_action.assert_not_called()
     mock_app._append_digit.assert_not_called()
     mock_app._clear_input.assert_not_called()
+
