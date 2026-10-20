@@ -29,6 +29,20 @@ This document outlines completed milestones, planned enhancements, architectural
   * 5-Tier escalating modal schedule guaranteeing that time-budget buttons never offer a duration shorter than $1.25 \times T_{\text{min\_step}}$.
   * Dedicated Tier 5 Deep Pi mode for 100M+ digits with informative time warnings and block calculation options.
 
+### FB-07: Visible, Expandable Local Seed Archive
+* **Status**: **Completed (v2.1)**
+* **Implementation**:
+  * External visible `dist/seed/pi_100m.zst` distributed directly alongside `PiPhone.exe` with embedded fallback.
+  * Automatic background seed expansion via `sync_seed_file()` whenever user calculations extend beyond 100M digits.
+  * Preserved GitHub 50 MB safety rule by preventing auto-overwrites to Git-tracked root `seed/` in dev mode.
+
+### FB-08: Mouse-Selectable Text Widgets & Clipboard Integration
+* **Status**: **Completed (v2.1)**
+* **Implementation**:
+  * Borderless interactive `tk.Text` (`self.txt_result`) with multi-font tag rendering for context digits (13pt muted) and target matches (24pt bold green).
+  * Borderless `ReadonlySelectableEntry` widgets for telemetry, positions, and history cards with native mouse drag highlighting.
+  * Full `Ctrl+C` copy and `Ctrl+A` select-all clipboard integration with `_on_key_press` modifier bypass preventing dialpad interference.
+
 ---
 
 ## 2. Active Backlog Items

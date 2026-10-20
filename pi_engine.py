@@ -47,28 +47,43 @@ def get_app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def get_seed_path() -> Optional[Path]:
+def get_seed_path(seed_dir: Optional[Path | str] = None) -> Optional[Path]:
     """
-    Locates the bundled 100M seed file.
-    When running in PyInstaller frozen bundle, sys._MEIPASS is checked first.
-    Falls back to sys.executable directory and __file__ directory.
+    Locates the 100M seed file.
+    Search priority:
+    1. Explicit custom seed_dir if provided.
+    2. When running in PyInstaller frozen bundle:
+       a. External visible seed directory next to .exe: Path(sys.executable).parent / "seed"
+       b. Next to executable: Path(sys.executable).parent
+       c. Embedded fallback: sys._MEIPASS / "seed" and sys._MEIPASS
+    3. In dev mode:
+       a. Project root seed/ directory: __file__.parent / "seed"
+       b. Project root directory: __file__.parent
     Supports .zst, .xz, and .gz extensions.
     """
     search_dirs: list[Path] = []
-    # 1. PyInstaller frozen unpacked bundle dir (_MEIPASS)
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        meipass_dir = Path(sys._MEIPASS).resolve()
-        search_dirs.append(meipass_dir / "seed")
-        search_dirs.append(meipass_dir)
-    # 2. Executable root directory (next to .exe)
+
+    # 0. Custom seed directory if specified
+    if seed_dir is not None:
+        s_p = Path(seed_dir).resolve()
+        search_dirs.append(s_p)
+        search_dirs.append(s_p / "seed")
+
+    # 1. Frozen executable external visible directory
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).resolve().parent
         search_dirs.append(exe_dir / "seed")
         search_dirs.append(exe_dir)
-    # 3. Source script root directory (dev mode)
-    script_dir = Path(__file__).resolve().parent
-    search_dirs.append(script_dir / "seed")
-    search_dirs.append(script_dir)
+        # Embedded fallback in temporary unpacked dir (_MEIPASS)
+        if hasattr(sys, "_MEIPASS"):
+            meipass_dir = Path(sys._MEIPASS).resolve()
+            search_dirs.append(meipass_dir / "seed")
+            search_dirs.append(meipass_dir)
+    else:
+        # 2. Source script root directory (dev mode)
+        script_dir = Path(__file__).resolve().parent
+        search_dirs.append(script_dir / "seed")
+        search_dirs.append(script_dir)
 
     for d in search_dirs:
         for fname in ["pi_100m.zst", "pi_100m.xz", "pi_100m.gz", "pi_100m.txt.gz"]:
@@ -76,6 +91,52 @@ def get_seed_path() -> Optional[Path]:
             if candidate.exists():
                 return candidate
     return None
+
+
+def compress_seed_file(digits: str, output_path: Path) -> None:
+    """
+    Compresses digits string to output_path using zstandard, lzma, or gzip
+    based on file extension. Writes atomically via temporary file.
+    """
+    import uuid
+
+    raw_bytes = digits.encode("ascii")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.parent / f"{output_path.name}.{uuid.uuid4().hex}.tmp"
+
+    try:
+        if output_path.name.endswith(".zst"):
+            try:
+                import zstandard as zstd
+                # Level 3 provides fast incremental compression for expanded streams
+                cctx = zstd.ZstdCompressor(level=3)
+                compressed = cctx.compress(raw_bytes)
+                with open(temp_path, "wb") as f:
+                    f.write(compressed)
+                temp_path.replace(output_path)
+                return
+            except ImportError:
+                pass
+
+        if output_path.name.endswith(".xz"):
+            import lzma
+            compressed = lzma.compress(raw_bytes, preset=1)
+            with open(temp_path, "wb") as f:
+                f.write(compressed)
+            temp_path.replace(output_path)
+            return
+
+        import gzip
+        compressed = gzip.compress(raw_bytes, compresslevel=3)
+        with open(temp_path, "wb") as f:
+            f.write(compressed)
+        temp_path.replace(output_path)
+    finally:
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
 
 
 def decompress_seed_file(seed_path: Path) -> str:
@@ -244,6 +305,7 @@ class PiEngine:
         data_dir: str | Path | None = None,
         default_seed_digits: int = 100_000_000,
         load_seed_pack: Optional[bool] = None,
+        seed_dir: str | Path | None = None,
     ):
         if data_dir is None:
             self.data_dir = get_app_dir() / "data"
@@ -255,9 +317,11 @@ class PiEngine:
                 self.data_dir = get_app_dir() / p
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
+        self.custom_seed_dir = Path(seed_dir).resolve() if seed_dir is not None else None
+
         if load_seed_pack is None:
-            # Load seed pack by default in production or whenever data_dir is standard data/
-            if data_dir is None or str(data_dir).rstrip("/\\") in ("data", str(get_app_dir() / "data")):
+            # Load seed pack by default in production or whenever data_dir is standard data/ or custom seed_dir provided
+            if self.custom_seed_dir is not None or data_dir is None or str(data_dir).rstrip("/\\") in ("data", str(get_app_dir() / "data")):
                 self._should_load_seed = True
             else:
                 self._should_load_seed = (default_seed_digits >= 100_000_000)
@@ -269,6 +333,8 @@ class PiEngine:
         self.history_file = self.data_dir / "search_history.json"
 
         self._lock = threading.Lock()
+        self._seed_lock = threading.Lock()
+        self._sync_seed_thread: Optional[threading.Thread] = None
         self.digits: str = ""
         # Sorted list of (query, position_1based) for fast binary search
         self.query_cache: list[tuple[str, int]] = []
@@ -304,30 +370,68 @@ class PiEngine:
         self.last_calc_time = max(0.001, elapsed)
         self.has_calibrated_benchmark = True
 
+    def sync_seed_file(self) -> None:
+        """
+        Updates the local external seed archive with the current self.digits stream.
+        GitHub Safety Rule:
+        - When frozen (.exe), updates dist/seed/pi_100m.zst (or external seed path).
+        - If self.custom_seed_dir is set (e.g. in test suites), updates that seed file.
+        - In standard dev mode, does NOT overwrite project root seed/pi_100m.zst to prevent >50MB git commits.
+        """
+        # If a background sync thread is already running from another thread, wait for it
+        if (
+            self._sync_seed_thread is not None
+            and self._sync_seed_thread.is_alive()
+            and threading.current_thread() != self._sync_seed_thread
+        ):
+            self._sync_seed_thread.join()
+
+        with self._seed_lock:
+            target_seed_path: Optional[Path] = None
+
+            if self.custom_seed_dir is not None:
+                target_seed_path = self.custom_seed_dir / "pi_100m.zst"
+            elif getattr(sys, "frozen", False):
+                exe_dir = Path(sys.executable).resolve().parent
+                target_seed_path = exe_dir / "seed" / "pi_100m.zst"
+
+            if target_seed_path is not None and len(self.digits) > 0:
+                try:
+                    compress_seed_file(self.digits, target_seed_path)
+                except Exception:
+                    pass
+
+    def _sync_seed_in_background(self) -> None:
+        """Spawns a non-blocking thread to synchronize the external seed file."""
+        t = threading.Thread(target=self.sync_seed_file, daemon=True)
+        self._sync_seed_thread = t
+        t.start()
+
     def _load_state(self, default_seed_digits: int) -> None:
         """Loads cached digits and sorted indices from disk, extracts bundled seed, or seeds initial digits."""
-        # Check if digits_file exists and is full 100M
+        # Check if digits_file exists and has full seed digits
         file_needs_seed = True
+        min_expected = 100_000_000 if self.custom_seed_dir is None else 1
         if self.digits_file.exists():
             try:
                 file_size = self.digits_file.stat().st_size
-                if file_size >= 100_000_000:
+                if file_size >= min_expected:
                     file_needs_seed = False
                     with open(self.digits_file, "r", encoding="ascii") as f:
                         self.digits = f.read().strip()
                 else:
-                    # File exists but is smaller than 100M (e.g. outdated/partial cache)
+                    # File exists but is smaller than expected (e.g. outdated/partial cache)
                     file_needs_seed = True
             except Exception:
                 file_needs_seed = True
 
-        # Extract bundled 100M seed if file is missing or smaller than 100M
+        # Extract bundled or external seed if file is missing or smaller than expected
         if file_needs_seed and self._should_load_seed:
-            seed_path = get_seed_path()
+            seed_path = get_seed_path(self.custom_seed_dir)
             if seed_path is not None:
                 try:
                     seed_digits = decompress_seed_file(seed_path)
-                    if len(seed_digits) >= 100_000_000:
+                    if self.custom_seed_dir is not None or len(seed_digits) >= 100_000_000:
                         self.digits = seed_digits
                         with open(self.digits_file, "w", encoding="ascii") as f:
                             f.write(self.digits)
@@ -859,6 +963,7 @@ class PiEngine:
                         self.digits = new_digits
                         with open(self.digits_file, "w", encoding="ascii") as f:
                             f.write(self.digits)
+                    self._sync_seed_in_background()
 
                     cur_elapsed = time.perf_counter() - start_burst
                     report_progress(
@@ -907,6 +1012,7 @@ class PiEngine:
                     self.digits = new_digits
                     with open(self.digits_file, "w", encoding="ascii") as f:
                         f.write(self.digits)
+                self._sync_seed_in_background()
 
                 report_progress(len(self.digits), time.perf_counter() - start_time)
 
@@ -969,6 +1075,7 @@ class PiEngine:
                 self.last_calc_time = max(0.001, calc_duration)
                 with open(self.digits_file, "w", encoding="ascii") as f:
                     f.write(self.digits)
+            self._sync_seed_in_background()
 
     def log_history(self, result: SearchResult) -> None:
         """Appends a search result to the search history JSON log."""

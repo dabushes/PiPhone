@@ -1,7 +1,7 @@
 """
 PiPhone - Interactive Dark-Mode Pi Dialer & Decimal Expansion Search Engine
-Version 1.1: Checkpoint Pausing, Total Digits Banner, Contextual Ellipses,
-and Keyboard/Numpad input bindings.
+Version 2.1: Visible Expandable Seed Archive, Mouse-Selectable Text Widgets (Ctrl+C),
+and T_min_step Dynamic Time-Budget Golden Rule.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import json
 import queue
 import threading
 import time
+import tkinter as tk
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -155,6 +156,137 @@ class CheckpointModal(ctk.CTkToplevel):
         self._select_action("stop")
 
 
+class ResultDisplayManager:
+    """
+    Manages the interactive, mouse-selectable Pi digit result display in a borderless tk.Text widget.
+    Renders preceding and following context in 14pt muted text, and the matched target sequence in
+    24pt bold bright accent text. Supports full mouse drag selection and Ctrl+C clipboard copying
+    while strictly preventing keyboard modification.
+    """
+
+    def __init__(self, txt_widget: tk.Text):
+        self.txt = txt_widget
+        self.preceding = ""
+        self.target = "—"
+        self.following = ""
+        self._setup_bindings()
+        self.render()
+
+    def _setup_bindings(self):
+        def on_key(event):
+            # Allow Ctrl+C and Ctrl+A for clipboard copying
+            if (event.state & 4) and event.keysym.lower() in ("c", "a"):
+                return None
+            # Allow keyboard navigation keys
+            if event.keysym in ("Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next"):
+                return None
+            # Block all typing and editing keys
+            return "break"
+
+        self.txt.bind("<Key>", on_key)
+        self.txt.bind("<Control-c>", lambda e: (self.txt.event_generate("<<Copy>>"), "break")[1])
+        self.txt.bind("<Control-C>", lambda e: (self.txt.event_generate("<<Copy>>"), "break")[1])
+        self.txt.bind("<Control-a>", lambda e: (self.txt.tag_add("sel", "1.0", "end-1c"), "break")[1])
+        self.txt.bind("<Control-A>", lambda e: (self.txt.tag_add("sel", "1.0", "end-1c"), "break")[1])
+
+    def set_part(self, part: str, value: str):
+        if part == "preceding":
+            self.preceding = value
+        elif part == "target":
+            self.target = value
+        elif part == "following":
+            self.following = value
+        self.render()
+
+    def render(self):
+        self.txt.configure(state="normal")
+        self.txt.delete("1.0", "end")
+        self.txt.tag_configure("center", justify="center")
+        self.txt.tag_configure("context", font=("Segoe UI", 13), foreground="#9E9E9E")
+        self.txt.tag_configure("target", font=("Segoe UI", 24, "bold"), foreground="#4CAF50")
+
+        # Assemble formatted result with context styling
+        if self.preceding:
+            self.txt.insert("end", self.preceding + " ", ("center", "context"))
+        tgt = self.target if self.target else "—"
+        self.txt.insert("end", tgt, ("center", "target"))
+        if self.following:
+            self.txt.insert("end", " " + self.following, ("center", "context"))
+
+
+class _ResultPartProxy:
+    """Proxy providing configure(text=...) interface for preceding, target, and following parts."""
+
+    def __init__(self, manager: ResultDisplayManager, part: str):
+        self.manager = manager
+        self.part = part
+
+    def configure(self, **kwargs):
+        if "text" in kwargs:
+            self.manager.set_part(self.part, kwargs["text"])
+
+    def cget(self, key: str):
+        if key == "text":
+            return getattr(self.manager, self.part)
+        return ""
+
+
+class ReadonlySelectableEntry(tk.Entry):
+    """
+    Borderless, read-only Entry widget that permits mouse drag text selection
+    and Ctrl+C copying while strictly preventing keyboard modification.
+    Supports configure(text=...) for seamless compatibility with CTkLabel call signatures.
+    """
+
+    def __init__(
+        self,
+        master,
+        text: str = "",
+        font=("Segoe UI", 12),
+        fg: str = "gray75",
+        bg: str = "#1E1E1E",
+        justify: str = "center",
+        **kwargs,
+    ):
+        super().__init__(
+            master,
+            relief="flat",
+            highlightthickness=0,
+            bg=bg,
+            readonlybackground=bg,
+            fg=fg,
+            font=font,
+            justify=justify,
+            insertwidth=0,
+            exportselection=True,
+            **kwargs,
+        )
+        self.bind("<Control-c>", lambda e: (self.event_generate("<<Copy>>"), "break")[1])
+        self.bind("<Control-C>", lambda e: (self.event_generate("<<Copy>>"), "break")[1])
+        self.bind("<Control-a>", lambda e: (self.select_range(0, "end"), "break")[1])
+        self.bind("<Control-A>", lambda e: (self.select_range(0, "end"), "break")[1])
+        self.set_text(text)
+
+    def set_text(self, text: str):
+        self.configure(state="normal")
+        self.delete(0, "end")
+        self.insert(0, text)
+        self.configure(state="readonly")
+
+    def configure(self, **kwargs):
+        if "text" in kwargs:
+            self.set_text(kwargs.pop("text"))
+        if "text_color" in kwargs:
+            kwargs["fg"] = kwargs.pop("text_color")
+        if kwargs:
+            super().configure(**kwargs)
+
+    def cget(self, key: str):
+        if key == "text":
+            return self.get()
+        return super().cget(key)
+
+
 class PiPhoneApp(ctk.CTk):
     """
     Main PiPhone application window.
@@ -295,55 +427,45 @@ class PiPhoneApp(ctk.CTk):
         # Results & Flanking Context Display Container
         self.result_frame = ctk.CTkFrame(self.tab_dialer, fg_color="#1E1E1E", corner_radius=8)
         self.result_frame.grid(row=6, column=0, columnspan=3, padx=10, pady=(4, 10), sticky="ew")
-        self.result_frame.grid_columnconfigure((0, 1, 2), weight=1)
+        self.result_frame.grid_columnconfigure(0, weight=1)
 
-        # Context labels with strict font hierarchy (14pt muted vs 28pt bold accent)
-        context_container = ctk.CTkFrame(self.result_frame, fg_color="transparent")
-        context_container.grid(row=0, column=0, columnspan=3, pady=(10, 4), padx=8)
-
-        # Preceding 4 digits: Smaller, muted font (14pt gray)
-        self.lbl_preceding = ctk.CTkLabel(
-            context_container,
-            text="",
-            text_color="gray60",
-            font=ctk.CTkFont(size=14),
+        # Interactive, mouse-selectable Pi sequence display (borderless tk.Text with tags)
+        self.txt_result = tk.Text(
+            self.result_frame,
+            height=2,
+            bg="#1E1E1E",
+            relief="flat",
+            highlightthickness=0,
+            cursor="xterm",
+            exportselection=True,
+            wrap="none",
+            insertwidth=0,
         )
-        self.lbl_preceding.pack(side="left", padx=4)
+        self.txt_result.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 2))
 
-        # Target matched digits: Large, bold bright accent font (28pt bold)
-        self.lbl_target = ctk.CTkLabel(
-            context_container,
-            text="—",
-            text_color="#4CAF50",
-            font=ctk.CTkFont(size=28, weight="bold"),
-        )
-        self.lbl_target.pack(side="left", padx=6)
+        self.result_manager = ResultDisplayManager(self.txt_result)
+        self.lbl_preceding = _ResultPartProxy(self.result_manager, "preceding")
+        self.lbl_target = _ResultPartProxy(self.result_manager, "target")
+        self.lbl_following = _ResultPartProxy(self.result_manager, "following")
 
-        # Following 4 digits: Smaller, muted font (14pt gray)
-        self.lbl_following = ctk.CTkLabel(
-            context_container,
-            text="",
-            text_color="gray60",
-            font=ctk.CTkFont(size=14),
-        )
-        self.lbl_following.pack(side="left", padx=4)
-
-        # Telemetry & exact position info
-        self.lbl_position = ctk.CTkLabel(
+        # Telemetry & exact position info (borderless readonly selectable entries)
+        self.lbl_position = ReadonlySelectableEntry(
             self.result_frame,
             text="Enter a number and tap 'Find in Pi'",
-            text_color="gray70",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=("Segoe UI", 12, "bold"),
+            fg="gray75",
+            bg="#1E1E1E",
         )
-        self.lbl_position.grid(row=1, column=0, columnspan=3, pady=(2, 2))
+        self.lbl_position.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 2))
 
-        self.lbl_telemetry = ctk.CTkLabel(
+        self.lbl_telemetry = ReadonlySelectableEntry(
             self.result_frame,
             text="",
-            text_color="gray50",
-            font=ctk.CTkFont(size=11),
+            font=("Segoe UI", 10),
+            fg="gray50",
+            bg="#1E1E1E",
         )
-        self.lbl_telemetry.grid(row=2, column=0, columnspan=3, pady=(0, 8))
+        self.lbl_telemetry.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
 
     # =========================================================================
     # Tab 2: Search History
@@ -424,21 +546,25 @@ class PiPhoneApp(ctk.CTk):
 
             # Title: Query & Position
             title_text = f"{query}  →  Digit #{pos:,}"
-            lbl_title = ctk.CTkLabel(
+            lbl_title = ReadonlySelectableEntry(
                 card,
                 text=title_text,
-                font=ctk.CTkFont(size=14, weight="bold"),
-                text_color="#E0E0E0",
+                font=("Segoe UI", 12, "bold"),
+                fg="#E0E0E0",
+                bg="#232323",
+                justify="left",
             )
             lbl_title.grid(row=0, column=0, sticky="w", padx=10, pady=(6, 0))
 
             # Context snippet: pre [tgt] flw
             context_text = f"Context: {pre} [{tgt}] {flw}"
-            lbl_context = ctk.CTkLabel(
+            lbl_context = ReadonlySelectableEntry(
                 card,
                 text=context_text,
-                text_color="#4CAF50",
-                font=ctk.CTkFont(size=12),
+                font=("Segoe UI", 11),
+                fg="#4CAF50",
+                bg="#232323",
+                justify="left",
             )
             lbl_context.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 2))
 
@@ -553,6 +679,10 @@ class PiPhoneApp(ctk.CTk):
         - BackSpace: deletes trailing digit
         - Escape / Delete: clears entire input (CLR)
         """
+        # Bypass when Control modifier is active (allows Ctrl+C, Ctrl+A, etc. to pass to focused widget)
+        if event.state & 4:
+            return
+
         # Only active on the Pi Dialer tab
         if self.tabs.get() != "Pi Dialer":
             return

@@ -15,7 +15,9 @@ from pi_engine import (
     CheckpointTierConfig,
     PiEngine,
     SearchResult,
+    compress_seed_file,
     compute_pi_digits,
+    decompress_seed_file,
     format_context,
     format_delta_digits,
     get_seed_path,
@@ -804,3 +806,55 @@ def test_tc22_initial_burst_on_cache_miss(tmp_path: Path):
     assert new_d == 900_000
     assert total_c == 1_000_000
     assert tier == 1
+
+
+# =====================================================================
+# TC-23: Local Seed Expansion & Persistence
+# =====================================================================
+def test_tc23_local_seed_expansion_and_persistence(tmp_path: Path):
+    """
+    TC-23: Verify that calculating new digits updates the external local seed
+    archive via sync_seed_file() when custom_seed_dir is specified, and that
+    a subsequent cold start in a fresh data directory automatically extracts
+    and reloads the newly expanded digit count from that updated seed.
+    """
+    custom_seed_dir = tmp_path / "custom_seed"
+    custom_seed_dir.mkdir(parents=True, exist_ok=True)
+    seed_archive = custom_seed_dir / "pi_100m.zst"
+
+    # Step 1: Create an initial seed of 100,000 digits in custom_seed_dir
+    initial_digits = compute_pi_digits(100_000)
+    compress_seed_file(initial_digits, seed_archive)
+    assert seed_archive.exists()
+    assert len(decompress_seed_file(seed_archive)) == 100_000
+
+    # Step 2: Initialize PiEngine backed by data_dir_1 pointing to custom_seed_dir
+    data_dir_1 = tmp_path / "data1"
+    engine1 = PiEngine(
+        data_dir=data_dir_1,
+        seed_dir=custom_seed_dir,
+        default_seed_digits=0,
+        load_seed_pack=True,
+    )
+    assert engine1.get_total_cached_digits() == 100_000
+
+    # Step 3: Expand digits to 150,000 and explicitly sync the external seed
+    engine1._expand_to_length(150_000)
+    assert engine1.get_total_cached_digits() == 150_000
+    engine1.sync_seed_file()
+
+    # Step 4: Verify external seed archive on disk was updated to 150,000 digits
+    reloaded_from_seed = decompress_seed_file(seed_archive)
+    assert len(reloaded_from_seed) == 150_000
+    assert reloaded_from_seed == engine1.digits
+
+    # Step 5: Cold start in a completely fresh data directory using that same seed_dir
+    data_dir_2 = tmp_path / "data2"
+    engine2 = PiEngine(
+        data_dir=data_dir_2,
+        seed_dir=custom_seed_dir,
+        default_seed_digits=0,
+        load_seed_pack=True,
+    )
+    assert engine2.get_total_cached_digits() == 150_000
+    assert engine2.digits == reloaded_from_seed

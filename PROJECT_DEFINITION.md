@@ -150,6 +150,17 @@ When a search misses the existing cache and calculates new digits:
 * **Seamless First-Launch Decompression**: On initial startup or first launch of `PiPhone.exe`, if `data/pi_digits.txt` has fewer than 100,000,000 digits, the engine automatically extracts the seed into the local cache.
 * **Instantaneous Searches**: 100% of 1-to-7 digit queries and ~63% of 8-digit queries resolve instantaneously in $< 20\text{ms}$ on first launch without requiring background CPU computation.
 
+### 2.11 Mouse-Selectable Text Across the UI (v2.1)
+* **Selectable Visual Display**: Replaces static result labels with a borderless `tk.Text` widget (`self.txt_result`) with `insertwidth=0`, `cursor="xterm"`, and `exportselection=True`. Preceding and following context digits are styled with muted 13pt tags (`"context"`), while the matched target sequence is styled with bold 24pt bright accent tags (`"target"`).
+* **Full Clipboard Compatibility (`Ctrl+C` / `Ctrl+A`)**: Users can drag-select or double-click to highlight any digits in the visual result, found position label, or telemetry label, and press `Ctrl+C` to copy them to the Windows clipboard.
+* **Keypad Control Bypass**: `_on_key_press` checks `event.state & 4` (Control key active) and immediately returns, preventing numpad or dialer actions from hijacking standard `Ctrl+C` copy or `Ctrl+A` select-all keystrokes.
+* **Read-Only API Proxy Layer**: `ReadonlySelectableEntry` and `_ResultPartProxy` maintain 100% drop-in compatibility with legacy `configure(text=...)` call signatures across worker threads and UI event loops.
+
+### 2.12 Visible & Expandable Local Seed Architecture (v2.1)
+* **Visible Seed Directory in Distribution (`dist/seed/`)**: In production builds, `seed/pi_100m.zst` sits visibly alongside `PiPhone.exe` inside `dist/seed/`, with embedded fallback to `sys._MEIPASS`.
+* **Automatic Seed Growth & Persistence**: Whenever a user calculates new digits beyond the initial 100,000,000 seed (e.g. into 102M, 110M+), `sync_seed_file()` automatically compresses and updates the external seed archive (`dist/seed/pi_100m.zst`) in the background.
+* **GitHub 50 MB Safety Preservation**: In standard development mode, `sync_seed_file()` strictly leaves the Git-tracked root `seed/` archive untouched, ensuring developer commits never exceed GitHub's 50 MB file limit while allowing deployed user installations to grow indefinitely.
+
 ---
 
 ## 3. Algorithmic & Storage Architecture

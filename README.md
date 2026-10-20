@@ -10,6 +10,8 @@
 |---------|-------------|
 | **Pi Dialer Tab** | Keypad (`0–9`, `CLR`, `⌫`), numeric input (1–10 digits with strict 11th-digit block), and full keyboard/numpad shortcuts. |
 | **Bundled 100M Seed Pack** | Bundled compressed 100,000,000-digit $\pi$ seed pack (`seed/pi_100m.zst`, 40.56 MB) enabling instantaneous (< 20ms) resolution for 1-to-7 digit numbers right out of the box. |
+| **Visible, Expandable Local Seed** | External visible seed archive in `dist/seed/` next to `PiPhone.exe` that automatically expands and updates on disk whenever new digits are computed beyond 100M. |
+| **Mouse-Selectable Text (`Ctrl+C`)** | Borderless selectable result and telemetry widgets allowing users to mouse drag-select or double-click any context digits, target matches, or position numbers and press `Ctrl+C` to copy them. |
 | **Hardware-Accelerated Math** | High-throughput Chudnovsky engine powered by `mpmath` and compiled C `gmpy2` (10x–15x speedup). |
 | **1M-Digit Initial Burst** | Searches missing the cache automatically calculate up to 1,000,000 digits in the initial burst before the first checkpoint modal. |
 | **Time-Budget Calculation Engine** | True wall-clock timer loop continuously expanding and searching $\pi$ in real-time adaptive chunks until the time budget (30s, 60s, 120s, 300s) is exhausted or the sequence is found. |
@@ -49,8 +51,10 @@ python piphone.py
 
 ### Building an Executable
 
-To package the application into a standalone desktop executable using PyInstaller:
+To package the application into a standalone desktop executable with bundled assets and external visible seed:
 
 ```sh
-pyinstaller --noconsole --onefile piphone.py
+pyinstaller --noconsole --onefile --name "PiPhone" --add-data "seed;seed" piphone.py
+# Copy seed directory to dist/ for external distribution
+python -c "import shutil, pathlib; (pathlib.Path('dist/seed')).mkdir(parents=True, exist_ok=True); shutil.copy2('seed/pi_100m.zst', 'dist/seed/pi_100m.zst')"
 ```
