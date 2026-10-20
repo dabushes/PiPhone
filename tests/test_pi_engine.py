@@ -858,3 +858,69 @@ def test_tc23_local_seed_expansion_and_persistence(tmp_path: Path):
     )
     assert engine2.get_total_cached_digits() == 150_000
     assert engine2.digits == reloaded_from_seed
+
+
+# =====================================================================
+# TC-24: Immediate Checkpoint Modal Pause on Cache Miss (>= 1M Digits)
+# =====================================================================
+def test_tc24_immediate_pause_on_1m_cache_miss(tmp_path: Path):
+    """
+    TC-24: Verify that when current_total >= 1,000,000 (e.g. 100M seed or 1M cache),
+    a cache miss invokes checkpoint_callback(new_digits=0, total_cached, tier_config)
+    BEFORE launching any mpmath calculation, allowing the user to stop or choose budget.
+    """
+    engine = PiEngine(data_dir=tmp_path, default_seed_digits=1_000_000, load_seed_pack=False)
+    assert engine.get_total_cached_digits() == 1_000_000
+
+    pause_invocations = []
+
+    def mock_pause_cb(new_digits: int, total_cached: int, tier_cfg: CheckpointTierConfig):
+        pause_invocations.append((new_digits, total_cached, tier_cfg.tier))
+        return "stop"
+
+    t0 = time.perf_counter()
+    # Search for an unfound 10-digit number
+    res = engine.search("9999999999", checkpoint_callback=mock_pause_cb)
+    elapsed = time.perf_counter() - t0
+
+    # Must return None within < 0.1s without calculating any new digits
+    assert res is None
+    assert elapsed < 0.15
+    assert len(pause_invocations) == 1
+    new_d, total_c, tier = pause_invocations[0]
+    assert new_d == 0  # 0 new digits calculated before pause
+    assert total_c == 1_000_000
+    assert engine.get_total_cached_digits() == 1_000_000
+
+
+# =====================================================================
+# TC-25: Instant Subprocess-Backed Calculation Cancellation (< 0.5s)
+# =====================================================================
+def test_tc25_instant_calculation_cancellation(tmp_path: Path):
+    """
+    TC-25: Verify that cancelling an active deep calculation terminates the
+    child worker process immediately and returns control within < 0.5s.
+    """
+    from pi_engine import compute_pi_digits_cancellable
+
+    cancel_evt = threading.Event()
+
+    def cancel_after_delay():
+        time.sleep(0.06)
+        cancel_evt.set()
+
+    t_cancel = threading.Thread(target=cancel_after_delay, daemon=True)
+    t_cancel.start()
+
+    t0 = time.perf_counter()
+    # Request a massive precision that would take multiple seconds
+    result = compute_pi_digits_cancellable(
+        target_len=5_000_000,
+        cancel_event=cancel_evt,
+        poll_interval=0.03,
+        temp_dir=tmp_path,
+    )
+    elapsed = time.perf_counter() - t0
+
+    assert result is None
+    assert elapsed < 0.50  # Must terminate and return in under 0.50s

@@ -161,6 +161,14 @@ When a search misses the existing cache and calculates new digits:
 * **Automatic Seed Growth & Persistence**: Whenever a user calculates new digits beyond the initial 100,000,000 seed (e.g. into 102M, 110M+), `sync_seed_file()` automatically compresses and updates the external seed archive (`dist/seed/pi_100m.zst`) in the background.
 * **GitHub 50 MB Safety Preservation**: In standard development mode, `sync_seed_file()` strictly leaves the Git-tracked root `seed/` archive untouched, ensuring developer commits never exceed GitHub's 50 MB file limit while allowing deployed user installations to grow indefinitely.
 
+### 2.13 Smartphone Proportions, Constrained Dialer Keypad & Dynamic Typography (v2.2)
+* **Sleek Smartphone Aspect Ratio**: The default window geometry is restored to `390x720` (`minsize(380, 680)`), presenting genuine handheld dialer proportions.
+* **Constrained Tactile Keypad**: Keypad buttons are wrapped in a constrained frame (`padx=28`) styled with rounded corners (`corner_radius=22`, font `22pt bold`, height `48px`), giving tactile phone ergonomics.
+* **Dynamic Target Font Scaling**: Target digits in the result display dynamically adapt font sizes based on query length (`26pt` for 1–6 digits, `22pt` for 7–8 digits, `19pt` for 9–10 digits) so that even 10-digit telephone numbers with surrounding context fit comfortably inside `390px` with zero horizontal clipping.
+* **Compact History Feed**: History cards render the View button in the top-right corner (`row=0, col=1`), allowing Line 2 (context) and Line 3 (metadata) to span across 100% of the card (`columnspan=2`) with compact notation (`"Cache (20.4ms) • 10/19 21:18"`).
+* **Accidental Double-Click Protection**: When `Find in Pi` is clicked, the button is disabled for `300ms` during state transition, preventing quick double-clicks from inadvertently firing `Cancel Search`.
+* **Indeterminate Progress Bar**: A pulsing `CTkProgressBar` activates above the live timer during active calculations, providing clear visual feedback that background math is running.
+
 ---
 
 ## 3. Algorithmic & Storage Architecture
@@ -239,7 +247,8 @@ $$\frac{1}{\pi} = 12 \sum_{k=0}^{\infty} \frac{(-1)^k (6k)! (545140134k + 135914
 
 1. **Non-Blocking GUI**: All heavy arithmetic and disk searches run exclusively on background threads. The main Tkinter event loop remains responsive at 60 FPS.
 2. **Thread-Safe Telemetry**: The background worker places periodic progress messages `(digits_searched, elapsed_seconds)` into a `queue.Queue`. The UI polls this queue every 50ms using `self.after(50, self._poll_search_queue)`.
-3. **Cooperative Cancellation**: When the user clicks **Cancel**, a `threading.Event` (`cancel_event.set()`) is flagged. The Chudnovsky chunk loop checks `cancel_event.is_set()` before starting each term iteration and chunk write. On abort, it writes the completed digits and terminates gracefully.
+3. **Instant Subprocess-Backed Cancellation (< 0.05s)**: Heavy `mpmath`/`gmpy2` precision computations run in a dedicated child process spawned via `compute_pi_digits_cancellable()`. When the user signals `Cancel Search`, `process.terminate()` issues an immediate OS-level process termination (`TerminateProcess`), aborting the compute worker instantly (< 0.05s) rather than blocking on long C loops.
+4. **Immediate Checkpoint Modal on Deep Cache Miss**: When `current_total >= 1,000,000` (such as when the 100M seed is loaded), a cache miss immediately pauses and presents the Checkpoint Modal before launching any multi-minute calculation, letting the user consciously select a budget or stop search.
 
 ---
 

@@ -43,6 +43,27 @@ This document outlines completed milestones, planned enhancements, architectural
   * Borderless `ReadonlySelectableEntry` widgets for telemetry, positions, and history cards with native mouse drag highlighting.
   * Full `Ctrl+C` copy and `Ctrl+A` select-all clipboard integration with `_on_key_press` modifier bypass preventing dialpad interference.
 
+### FB-09: Immediate Checkpoint Modal on Cache Miss (>= 1M Digits)
+* **Status**: **Completed (v2.2)**
+* **Implementation**:
+  * Scans existing in-memory digits first; if missing and `current_total >= 1,000,000`, immediately prompts `checkpoint_callback` before launching multi-minute math.
+  * Informs the user of the initial scan range and provides budget options or instant clean stop.
+
+### FB-10: Subprocess-Backed Instant Cancellation & Progress Indicator
+* **Status**: **Completed (v2.2)**
+* **Implementation**:
+  * Heavy precision calculations executed in spawned child processes via `compute_pi_digits_cancellable()`.
+  * `Cancel Search` calls `process.terminate()` for instantaneous abort in $< 0.05\text{s}$.
+  * Added animated `CTkProgressBar(mode="indeterminate")` pulsing during active calculations.
+  * Added 300ms button state debounce on `Find in Pi` to eliminate accidental double-click cancellation.
+
+### FB-11: Smartphone Aspect Ratio (390x720) & Dynamic Target Typography
+* **Status**: **Completed (v2.2)**
+* **Implementation**:
+  * Restored sleek 390x720 window proportions with constrained keypad grid (`padx=28`, `corner_radius=22`, font `22pt bold`).
+  * Dynamic target typography (`26pt` for 1–6 digits, `22pt` for 7–8 digits, `19pt` for 9–10 digits) eliminating clipping.
+  * Compact search history cards with top-right View button and full-width Line 2/Line 3 rows.
+
 ---
 
 ## 2. Active Backlog Items

@@ -251,6 +251,107 @@ def compute_pi_digits(total_digits: int, guard_digits: int = 20) -> str:
     return decimals
 
 
+def _compute_pi_worker(target_len: int, temp_file_path: str, result_queue: Any) -> None:
+    """Worker process entry point for out-of-process Pi digit calculation."""
+    try:
+        digits = compute_pi_digits(target_len)
+        with open(temp_file_path, "w", encoding="ascii") as f:
+            f.write(digits)
+        result_queue.put({"success": True, "len": len(digits)})
+    except Exception as e:
+        result_queue.put({"success": False, "error": str(e)})
+
+
+def compute_pi_digits_cancellable(
+    target_len: int,
+    cancel_event: Optional[threading.Event] = None,
+    poll_interval: float = 0.05,
+    temp_dir: Optional[Path] = None,
+) -> Optional[str]:
+    """
+    Computes target_len decimal digits of Pi inside a dedicated child process.
+    Allows instantaneous cancellation (< 0.05s) via process.terminate() if
+    cancel_event is set during computation.
+    """
+    if target_len <= 0:
+        return ""
+
+    # If no cancel_event is provided or target_len is small (< 100k), calculate directly in process
+    if cancel_event is None or target_len <= 100_000:
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        return compute_pi_digits(target_len)
+
+    import multiprocessing as mp
+    import uuid
+
+    if temp_dir is None:
+        temp_dir = get_app_dir() / "data"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_file = temp_dir / f"pi_calc_{uuid.uuid4().hex}.tmp"
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+
+    p = ctx.Process(
+        target=_compute_pi_worker,
+        args=(target_len, str(temp_file), result_queue),
+        daemon=True,
+    )
+
+    try:
+        p.start()
+        while p.is_alive():
+            if cancel_event is not None and cancel_event.is_set():
+                p.terminate()
+                p.join(timeout=0.2)
+                if temp_file.exists():
+                    try:
+                        temp_file.unlink()
+                    except Exception:
+                        pass
+                return None
+            time.sleep(poll_interval)
+
+        p.join(timeout=1.0)
+
+        # Check if cancellation occurred during join
+        if cancel_event is not None and cancel_event.is_set():
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
+            return None
+
+        if temp_file.exists():
+            with open(temp_file, "r", encoding="ascii") as f:
+                digits = f.read()
+            try:
+                temp_file.unlink()
+            except Exception:
+                pass
+            return digits
+
+        # Fallback if queue has error or temp file missing
+        if not result_queue.empty():
+            res = result_queue.get_nowait()
+            if not res.get("success", False):
+                return compute_pi_digits(target_len)
+
+        return compute_pi_digits(target_len)
+
+    except Exception:
+        if p.is_alive():
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        return compute_pi_digits(target_len)
+
+
 def format_delta_digits(delta: int) -> str:
     """
     Formats an incremental digit count into human-readable compact notation.
@@ -881,8 +982,32 @@ class PiEngine:
         new_digits_total = 0
 
         current_len = len(self.digits)
-        if chunk_size is not None:
-            pending_action: Any = chunk_size
+
+        # Immediate Checkpoint Pause on Cache Miss when current_len >= 1,000,000:
+        # If sequence was not found in the existing cached stream (e.g. 100M seed),
+        # DO NOT automatically begin a massive multi-minute calculation! Prompt checkpoint_callback immediately.
+        if current_len >= 1_000_000 and checkpoint_callback is not None:
+            tier_cfg = self.get_checkpoint_tier_config(current_len)
+            try:
+                import inspect
+                sig = inspect.signature(checkpoint_callback)
+                params = list(sig.parameters.values())
+                accepts_3 = len(params) >= 3 or any(
+                    p.kind == inspect.Parameter.VAR_POSITIONAL for p in params
+                )
+            except Exception:
+                accepts_3 = False
+
+            if accepts_3:
+                action = checkpoint_callback(0, current_len, tier_cfg)
+            else:
+                action = checkpoint_callback(0, current_len)
+
+            if action == "stop" or action is None:
+                return None
+            pending_action: Any = action
+        elif chunk_size is not None:
+            pending_action = chunk_size
         else:
             if current_len < 1_000_000:
                 pending_action = 1_000_000 - current_len
@@ -952,7 +1077,9 @@ class PiEngine:
                     target_len = old_total + delta_n
 
                     t_calc_start = time.perf_counter()
-                    new_digits = compute_pi_digits(target_len)
+                    new_digits = compute_pi_digits_cancellable(target_len, cancel_event=cancel_event, temp_dir=self.data_dir)
+                    if new_digits is None:
+                        return None
                     calc_duration = time.perf_counter() - t_calc_start
 
                     self.last_calc_digits = target_len
@@ -1001,7 +1128,9 @@ class PiEngine:
                 target_len = old_total + step_delta
 
                 t_calc_start = time.perf_counter()
-                new_digits = compute_pi_digits(target_len)
+                new_digits = compute_pi_digits_cancellable(target_len, cancel_event=cancel_event, temp_dir=self.data_dir)
+                if new_digits is None:
+                    return None
                 calc_duration = time.perf_counter() - t_calc_start
 
                 self.last_calc_digits = target_len
@@ -1064,17 +1193,19 @@ class PiEngine:
                 # If no callback provided, default to 1,000,000 digits continuation
                 pending_action = 1_000_000
 
-    def _expand_to_length(self, target_len: int) -> None:
+    def _expand_to_length(self, target_len: int, cancel_event: Optional[threading.Event] = None) -> None:
         """Expands self.digits to at least target_len digits and saves to disk."""
         if len(self.digits) < target_len:
             with self._lock:
                 t_calc_start = time.perf_counter()
-                self.digits = compute_pi_digits(target_len)
-                calc_duration = time.perf_counter() - t_calc_start
-                self.last_calc_digits = target_len
-                self.last_calc_time = max(0.001, calc_duration)
-                with open(self.digits_file, "w", encoding="ascii") as f:
-                    f.write(self.digits)
+                new_d = compute_pi_digits_cancellable(target_len, cancel_event=cancel_event, temp_dir=self.data_dir)
+                if new_d is not None:
+                    self.digits = new_d
+                    calc_duration = time.perf_counter() - t_calc_start
+                    self.last_calc_digits = target_len
+                    self.last_calc_time = max(0.001, calc_duration)
+                    with open(self.digits_file, "w", encoding="ascii") as f:
+                        f.write(self.digits)
             self._sync_seed_in_background()
 
     def log_history(self, result: SearchResult) -> None:

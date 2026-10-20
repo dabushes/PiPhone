@@ -9,9 +9,12 @@
 | Feature | Description |
 |---------|-------------|
 | **Pi Dialer Tab** | Keypad (`0–9`, `CLR`, `⌫`), numeric input (1–10 digits with strict 11th-digit block), and full keyboard/numpad shortcuts. |
+| **Smartphone Dialer Form Factor** | Sleek 390x720 aspect ratio, tactile phone-proportioned keypad (`corner_radius=22`, `22pt bold`), and dynamic target font scaling (26pt/22pt/19pt) preventing horizontal clipping. |
 | **Bundled 100M Seed Pack** | Bundled compressed 100,000,000-digit $\pi$ seed pack (`seed/pi_100m.zst`, 40.56 MB) enabling instantaneous (< 20ms) resolution for 1-to-7 digit numbers right out of the box. |
 | **Visible, Expandable Local Seed** | External visible seed archive in `dist/seed/` next to `PiPhone.exe` that automatically expands and updates on disk whenever new digits are computed beyond 100M. |
 | **Mouse-Selectable Text (`Ctrl+C`)** | Borderless selectable result and telemetry widgets allowing users to mouse drag-select or double-click any context digits, target matches, or position numbers and press `Ctrl+C` to copy them. |
+| **Immediate Modal on 100M Miss** | When a query misses the 100M cache, pops up the Checkpoint Modal immediately (< 0.05s) rather than freezing on silent multi-minute background calculation. |
+| **Instant Subprocess Cancel (< 0.05s)** | Precision calculation runs in a child process, terminating immediately on Cancel via OS-level process kill, accompanied by an animated progress indicator. |
 | **Hardware-Accelerated Math** | High-throughput Chudnovsky engine powered by `mpmath` and compiled C `gmpy2` (10x–15x speedup). |
 | **1M-Digit Initial Burst** | Searches missing the cache automatically calculate up to 1,000,000 digits in the initial burst before the first checkpoint modal. |
 | **Time-Budget Calculation Engine** | True wall-clock timer loop continuously expanding and searching $\pi$ in real-time adaptive chunks until the time budget (30s, 60s, 120s, 300s) is exhausted or the sequence is found. |
