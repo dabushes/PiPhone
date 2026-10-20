@@ -15,8 +15,15 @@ import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple
+
+from pi_binary_index import (
+    BinaryIndexMode,
+    PiBinaryIndex,
+    format_latency,
+)
 
 # Explicit import for PyInstaller bundling of C-extensions
 try:
@@ -392,6 +399,11 @@ class CheckpointTierConfig:
     note: str = ""
 
 
+class SearchEngineMode(str, Enum):
+    STANDARD_ENGINE = "standard"
+    BINARY_INDEX_ENGINE = "binary_index"
+
+
 @dataclass
 class SearchResult:
     query: str
@@ -402,6 +414,7 @@ class SearchResult:
     elapsed_seconds: float
     source: str  # "Sorted Index Cache" or "Calculated"
     new_digits_calculated: int = 0
+    engine_mode: str = "Standard Engine"
 
 
 class PiEngine:
@@ -459,6 +472,10 @@ class PiEngine:
             self.last_calc_digits = 100_000
             self.last_calc_time = 0.35
             self.has_calibrated_benchmark = False
+
+        # Binary Index (.piidx) engine state
+        self.binary_index: Optional[PiBinaryIndex] = None
+        self.binary_index_path: Optional[Path] = None
 
         self._load_state(default_seed_digits)
 
@@ -682,6 +699,38 @@ class PiEngine:
 
         # Ensure query cache is strictly sorted using Timsort
         self._sort_indices()
+
+        # Auto-discover and load .piidx binary index if present
+        candidate_indices = [
+            self.data_dir / "pi_10digit.piidx",
+            get_app_dir() / "data" / "pi_10digit.piidx",
+            get_app_dir() / "seed" / "pi_10digit.piidx",
+        ]
+        for cand in candidate_indices:
+            if cand.exists():
+                try:
+                    self.load_binary_index(cand)
+                    break
+                except Exception:
+                    pass
+
+    def load_binary_index(self, index_path: str | Path) -> PiBinaryIndex:
+        """Loads and memory-maps a .piidx binary index file."""
+        with self._lock:
+            if self.binary_index is not None:
+                self.unload_binary_index()
+            idx = PiBinaryIndex(index_path)
+            self.binary_index = idx
+            self.binary_index_path = idx.path
+            return idx
+
+    def unload_binary_index(self) -> None:
+        """Unloads and unmaps the current binary index."""
+        with self._lock:
+            if self.binary_index is not None:
+                self.binary_index.close()
+                self.binary_index = None
+                self.binary_index_path = None
 
     def _sort_indices(self) -> None:
         """Sorts query cache using Python's native Timsort."""
@@ -1018,6 +1067,174 @@ class PiEngine:
             )
 
     def search(
+        self,
+        query: str,
+        chunk_size: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Callable[[int, float], None]] = None,
+        checkpoint_callback: Optional[Callable[..., str | int | None]] = None,
+        engine_mode: SearchEngineMode | str = SearchEngineMode.STANDARD_ENGINE,
+    ) -> Optional[SearchResult]:
+        """
+        Executes the search strategy:
+        - STANDARD_ENGINE: Existing in-memory cached seed + live calculation bursts.
+        - BINARY_INDEX_ENGINE: High-speed memory-mapped lookup for 10-digit numbers with automatic fallback rules:
+            * 1-9 digits: Falls back to Standard Engine with [Fallback: Standard Engine (1-9 digit query)].
+            * 10 digits (Index Hit): Returns exact 1-based position immediately (Hit in X.XX ms) with no context digits.
+            * 10 digits (Index Miss / No Index): Falls back to Standard Engine.
+        """
+        mode_val = str(engine_mode).lower()
+        if "binary" in mode_val:
+            return self._search_binary_index(
+                query=query,
+                chunk_size=chunk_size,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                checkpoint_callback=checkpoint_callback,
+            )
+        else:
+            return self._search_standard(
+                query=query,
+                chunk_size=chunk_size,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                checkpoint_callback=checkpoint_callback,
+            )
+
+    def _search_binary_index(
+        self,
+        query: str,
+        chunk_size: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Callable[[int, float], None]] = None,
+        checkpoint_callback: Optional[Callable[..., str | int | None]] = None,
+    ) -> Optional[SearchResult]:
+        """
+        Executes binary index search with automatic fallback rules.
+        """
+        clean_query = validate_query(query)
+        q_len = len(clean_query)
+        start_time = time.perf_counter()
+
+        # Case A: 1-9 digits -> Automatic fallback to Standard Engine
+        if q_len < 10:
+            res = self._search_standard(
+                query=clean_query,
+                chunk_size=chunk_size,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                checkpoint_callback=checkpoint_callback,
+            )
+            if res is not None:
+                res.engine_mode = "Binary Index (Fallback: 1-9 Digits)"
+                res.source = f"[Fallback: Standard Engine (1-9 digit query)] • {res.source}"
+            return res
+
+        # Case C1: No binary index loaded -> Automatic fallback to Standard Engine
+        if self.binary_index is None:
+            res = self._search_standard(
+                query=clean_query,
+                chunk_size=chunk_size,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+                checkpoint_callback=checkpoint_callback,
+            )
+            if res is not None:
+                res.engine_mode = "Binary Index (No Index Loaded)"
+                res.source = f"[No Index Loaded -> Fallback: Standard Engine] • {res.source}"
+            return res
+
+        # Binary index is loaded!
+        b_idx = self.binary_index
+        hit_pos: Optional[int] = None
+
+        # Check cutoff_pos rule for STRAGGLER mode
+        if b_idx.mode == BinaryIndexMode.STRAGGLER_SORTED_10B and b_idx.cutoff_pos > 0:
+            cutoff = b_idx.cutoff_pos
+            scan_limit = min(len(self.digits), cutoff + 9)
+            local_idx = self.digits[:scan_limit].find(clean_query)
+            if local_idx != -1 and (local_idx + 1) <= cutoff:
+                hit_pos = local_idx + 1
+            else:
+                hit_pos = b_idx.lookup(clean_query)
+        else:
+            hit_pos = b_idx.lookup(clean_query)
+
+        # Case B: Index Hit!
+        if hit_pos is not None:
+            elapsed = time.perf_counter() - start_time
+            self.record_query_match(clean_query, hit_pos)
+            return SearchResult(
+                query=clean_query,
+                position=hit_pos,
+                preceding="",
+                target=clean_query,
+                following="",
+                elapsed_seconds=elapsed,
+                source=f"[Engine: 10-Digit Binary Index (Hit in {format_latency(elapsed)})]",
+                new_digits_calculated=0,
+                engine_mode="Binary Index",
+            )
+
+        # Case C2: Index Miss (number did not appear in scanned range)
+        max_scanned = b_idx.max_pi_digit_scanned
+        res = self._search_standard(
+            query=clean_query,
+            chunk_size=chunk_size,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+            checkpoint_callback=checkpoint_callback,
+        )
+        if res is not None:
+            res.engine_mode = "Binary Index (Fallback: Miss)"
+            res.source = f"[Index Miss (Scanned up to Digit #{max_scanned:,}) -> Fallback: Standard Engine] • {res.source}"
+        return res
+
+    def compare_engines(
+        self,
+        query: str,
+        cancel_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Callable[..., None]] = None,
+        checkpoint_callback: Optional[Callable[..., None]] = None,
+    ) -> Tuple[Optional[SearchResult], Optional[SearchResult], Optional[float]]:
+        """
+        Executes query against both Standard Engine and Binary Index Engine back-to-back.
+        Returns (res_standard, res_binary, speedup_factor).
+        """
+        clean_query = validate_query(query)
+
+        # 1. Standard Engine search
+        res_std = self.search(
+            clean_query,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+            checkpoint_callback=checkpoint_callback,
+            engine_mode=SearchEngineMode.STANDARD_ENGINE,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            return None, None, None
+
+        # 2. Binary Index Engine search
+        res_bin = self.search(
+            clean_query,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+            checkpoint_callback=checkpoint_callback,
+            engine_mode=SearchEngineMode.BINARY_INDEX_ENGINE,
+        )
+
+        speedup: Optional[float] = None
+        if (
+            res_std is not None
+            and res_bin is not None
+            and res_bin.elapsed_seconds > 0
+            and res_std.elapsed_seconds > 0
+        ):
+            speedup = res_std.elapsed_seconds / res_bin.elapsed_seconds
+
+        return res_std, res_bin, speedup
+
+    def _search_standard(
         self,
         query: str,
         chunk_size: Optional[int] = None,

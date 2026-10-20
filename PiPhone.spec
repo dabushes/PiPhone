@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('seed', 'seed')]
 binaries = []
-hiddenimports = ['_pylong']
+hiddenimports = ['_pylong', 'pi_binary_index', 'pi_index_builder', 'zstandard']
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('gmpy2')

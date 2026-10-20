@@ -27,9 +27,15 @@ except ImportError:
 
 import customtkinter as ctk
 
+from pi_binary_index import (
+    BinaryIndexMode,
+    PiBinaryIndex,
+    format_latency,
+)
 from pi_engine import (
     CheckpointTierConfig,
     PiEngine,
+    SearchEngineMode,
     SearchResult,
     format_context,
     format_delta_digits,
@@ -168,6 +174,336 @@ class CheckpointModal(ctk.CTkToplevel):
     def _on_close(self):
         """Treat closing modal with 'X' as stopping search."""
         self._select_action("stop")
+
+
+class IndexManagerDialog(ctk.CTkToplevel):
+    """
+    Modal dialog for managing, inspecting, and building .piidx 10-digit binary index files.
+    """
+
+    def __init__(self, parent: "PiPhoneApp"):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("10-Digit Binary Index Manager (.piidx)")
+        self.geometry("460x540")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        self._build_thread: Optional[threading.Thread] = None
+        self._cancel_build_event = threading.Event()
+
+        # Center over parent
+        self.update_idletasks()
+        try:
+            x = parent.winfo_x() + (parent.winfo_width() // 2) - 230
+            y = parent.winfo_y() + (parent.winfo_height() // 2) - 270
+            self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
+        self._build_ui()
+        self._refresh_status()
+
+    def _build_ui(self):
+        # Section 1: Active Index Status Card
+        card_active = ctk.CTkFrame(self, fg_color="#1E1E1E", corner_radius=8)
+        card_active.pack(fill="x", padx=16, pady=(14, 8))
+
+        lbl_hdr1 = ctk.CTkLabel(
+            card_active,
+            text="Active 10-Digit Binary Index",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#00E5FF",
+        )
+        lbl_hdr1.pack(anchor="w", padx=12, pady=(10, 4))
+
+        self.lbl_idx_file = ctk.CTkLabel(card_active, text="File: None", font=ctk.CTkFont(size=12), text_color="gray80", anchor="w")
+        self.lbl_idx_file.pack(fill="x", padx=12, pady=1)
+
+        self.lbl_idx_mode = ctk.CTkLabel(card_active, text="Mode: None", font=ctk.CTkFont(size=12), text_color="gray80", anchor="w")
+        self.lbl_idx_mode.pack(fill="x", padx=12, pady=1)
+
+        self.lbl_idx_range = ctk.CTkLabel(card_active, text="Scanned: 0 digits | Cutoff: 0", font=ctk.CTkFont(size=12), text_color="gray80", anchor="w")
+        self.lbl_idx_range.pack(fill="x", padx=12, pady=1)
+
+        self.lbl_idx_records = ctk.CTkLabel(card_active, text="Records: 0", font=ctk.CTkFont(size=12), text_color="gray80", anchor="w")
+        self.lbl_idx_records.pack(fill="x", padx=12, pady=1)
+
+        btn_row = ctk.CTkFrame(card_active, fg_color="transparent")
+        btn_row.pack(fill="x", padx=12, pady=(8, 10))
+
+        self.btn_select_file = ctk.CTkButton(
+            btn_row,
+            text="📂 Load .piidx File...",
+            width=150,
+            height=28,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#0277BD",
+            hover_color="#01579B",
+            command=self._on_select_file,
+        )
+        self.btn_select_file.pack(side="left", padx=(0, 6))
+
+        self.btn_unload = ctk.CTkButton(
+            btn_row,
+            text="❌ Unload Index",
+            width=110,
+            height=28,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#C62828",
+            hover_color="#B71C1C",
+            command=self._on_unload,
+        )
+        self.btn_unload.pack(side="left")
+
+        # Section 2: Index Builder Card
+        card_build = ctk.CTkFrame(self, fg_color="#1E1E1E", corner_radius=8)
+        card_build.pack(fill="both", expand=True, padx=16, pady=(4, 14))
+
+        lbl_hdr2 = ctk.CTkLabel(
+            card_build,
+            text="Build New Binary Index",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#4CAF50",
+        )
+        lbl_hdr2.pack(anchor="w", padx=12, pady=(10, 4))
+
+        # Stream Source Selection
+        lbl_src = ctk.CTkLabel(card_build, text="Pi Stream Source:", font=ctk.CTkFont(size=11), text_color="gray70", anchor="w")
+        lbl_src.pack(fill="x", padx=12, pady=(2, 0))
+
+        cached_digits_count = self.parent.engine.get_total_cached_digits()
+        self.source_var = ctk.StringVar(value="local")
+        self.seg_source = ctk.CTkSegmentedButton(
+            card_build,
+            values=["Local Pi Cache", "External File"],
+            variable=self.source_var,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            height=28,
+        )
+        self.seg_source.pack(fill="x", padx=12, pady=(2, 6))
+
+        # Mode Selection
+        lbl_mode = ctk.CTkLabel(card_build, text="Index Format Architecture:", font=ctk.CTkFont(size=11), text_color="gray70", anchor="w")
+        lbl_mode.pack(fill="x", padx=12, pady=(2, 0))
+
+        self.mode_var = ctk.StringVar(value="straggler")
+        self.seg_mode = ctk.CTkSegmentedButton(
+            card_build,
+            values=["Straggler (10B Sorted)", "Full Direct (5B Array)"],
+            variable=self.mode_var,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            height=28,
+        )
+        self.seg_mode.pack(fill="x", padx=12, pady=(2, 6))
+
+        # Cutoff Input
+        cutoff_row = ctk.CTkFrame(card_build, fg_color="transparent")
+        cutoff_row.pack(fill="x", padx=12, pady=(2, 6))
+        lbl_cutoff = ctk.CTkLabel(cutoff_row, text="Straggler Cutoff Pos:", font=ctk.CTkFont(size=11), text_color="gray70")
+        lbl_cutoff.pack(side="left", padx=(0, 8))
+        self.entry_cutoff = ctk.CTkEntry(cutoff_row, width=120, height=26, font=ctk.CTkFont(size=12))
+        self.entry_cutoff.insert(0, "0")
+        self.entry_cutoff.pack(side="left")
+
+        # Progress bar
+        self.build_prog = ctk.CTkProgressBar(card_build, mode="indeterminate", height=6, progress_color="#4CAF50")
+        self.build_prog.pack(fill="x", padx=12, pady=(6, 2))
+        self.build_prog.set(0)
+
+        # Telemetry
+        self.lbl_build_status = ctk.CTkLabel(
+            card_build,
+            text=f"Ready to build index ({cached_digits_count:,} cached digits available).",
+            font=ctk.CTkFont(size=11),
+            text_color="gray70",
+            anchor="w",
+        )
+        self.lbl_build_status.pack(fill="x", padx=12, pady=(1, 8))
+
+        # Start / Cancel Build Buttons
+        build_action_row = ctk.CTkFrame(card_build, fg_color="transparent")
+        build_action_row.pack(fill="x", padx=12, pady=(0, 10))
+
+        self.btn_start_build = ctk.CTkButton(
+            build_action_row,
+            text="⚡ Start Build",
+            width=140,
+            height=32,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#2E7D32",
+            hover_color="#1B5E20",
+            command=self._on_start_build,
+        )
+        self.btn_start_build.pack(side="left", padx=(0, 8))
+
+        self.btn_cancel_build = ctk.CTkButton(
+            build_action_row,
+            text="Cancel",
+            width=80,
+            height=32,
+            font=ctk.CTkFont(size=12),
+            fg_color="#37474F",
+            hover_color="#455A64",
+            state="disabled",
+            command=self._on_cancel_build,
+        )
+        self.btn_cancel_build.pack(side="left")
+
+    def _refresh_status(self):
+        b_idx = self.parent.engine.binary_index
+        if b_idx is not None:
+            self.lbl_idx_file.configure(text=f"File: {b_idx.path.name} ({b_idx.file_size / (1024*1024):.1f} MB)", text_color="#E0E0E0")
+            mode_name = "Mode 1: STRAGGLER_SORTED_10B" if b_idx.mode == BinaryIndexMode.STRAGGLER_SORTED_10B else "Mode 2: FULL_DIRECT_5B"
+            self.lbl_idx_mode.configure(text=f"Mode: {mode_name}", text_color="#E0E0E0")
+            self.lbl_idx_range.configure(
+                text=f"Scanned: {b_idx.max_pi_digit_scanned:,} digits | Cutoff: {b_idx.cutoff_pos:,}",
+                text_color="#E0E0E0",
+            )
+            self.lbl_idx_records.configure(text=f"Records: {b_idx.record_count:,} pairs", text_color="#E0E0E0")
+            self.btn_unload.configure(state="normal")
+        else:
+            self.lbl_idx_file.configure(text="File: None (Standard Live Engine fallback active)", text_color="gray60")
+            self.lbl_idx_mode.configure(text="Mode: None", text_color="gray60")
+            self.lbl_idx_range.configure(text="Scanned: 0 digits | Cutoff: 0", text_color="gray60")
+            self.lbl_idx_records.configure(text="Records: 0", text_color="gray60")
+            self.btn_unload.configure(state="disabled")
+
+        self.parent._refresh_engine_ui()
+
+    def _on_select_file(self):
+        from tkinter import filedialog, messagebox
+        f = filedialog.askopenfilename(
+            parent=self,
+            title="Select 10-Digit Binary Index (.piidx)",
+            filetypes=[("Pi Binary Index (*.piidx)", "*.piidx"), ("All Files (*.*)", "*.*")],
+        )
+        if f:
+            try:
+                self.parent.engine.load_binary_index(f)
+                self._refresh_status()
+                messagebox.showinfo("Index Loaded", f"Successfully loaded index:\n{f}", parent=self)
+            except Exception as e:
+                messagebox.showerror("Index Error", f"Failed to load binary index:\n{e}", parent=self)
+
+    def _on_unload(self):
+        self.parent.engine.unload_binary_index()
+        self._refresh_status()
+
+    def _on_start_build(self):
+        from tkinter import filedialog, messagebox
+        from pi_index_builder import BinaryIndexBuilder
+
+        src_type = self.source_var.get()
+        mode_val = (
+            BinaryIndexMode.FULL_DIRECT_5B
+            if "Direct" in self.seg_mode.get()
+            else BinaryIndexMode.STRAGGLER_SORTED_10B
+        )
+
+        try:
+            cutoff = int(self.entry_cutoff.get().strip().replace(",", ""))
+        except ValueError:
+            cutoff = 0
+
+        ext_input_path = None
+        if src_type != "local":
+            ext_input_path = filedialog.askopenfilename(
+                parent=self,
+                title="Select Input Pi Stream (.txt, .zst, .gz, y-cruncher)",
+                filetypes=[
+                    ("Pi Stream Files (*.txt;*.zst;*.gz)", "*.txt;*.zst;*.gz"),
+                    ("Text Files (*.txt)", "*.txt"),
+                    ("All Files (*.*)", "*.*"),
+                ],
+            )
+            if not ext_input_path:
+                return
+
+        out_path = self.parent.engine.data_dir / "pi_10digit.piidx"
+
+        self._cancel_build_event.clear()
+        self.btn_start_build.configure(state="disabled")
+        self.btn_cancel_build.configure(state="normal")
+        self.build_prog.start()
+        self.lbl_build_status.configure(text="Initializing index build...", text_color="#FFA000")
+
+        def worker():
+            try:
+                builder = BinaryIndexBuilder(
+                    mode=mode_val,
+                    cutoff_pos=cutoff,
+                    output_path=out_path,
+                )
+
+                def prog(scanned: int, unique: int, rate: float):
+                    txt = f"Scanned: {scanned:,} digits | Unique: {unique:,} | {rate/1_000_000:.2f}M digits/s"
+                    self.after(0, lambda: self.lbl_build_status.configure(text=txt))
+
+                if src_type == "local":
+                    digits_str = self.parent.engine.digits
+                    if not digits_str:
+                        raise ValueError("No local Pi digits cached to build index from.")
+                    final_path = builder.build_from_string(
+                        digits_str,
+                        progress_callback=prog,
+                        cancel_event=self._cancel_build_event,
+                    )
+                else:
+                    final_path = builder.build_from_file(
+                        ext_input_path,
+                        progress_callback=prog,
+                        cancel_event=self._cancel_build_event,
+                    )
+
+                if self._cancel_build_event.is_set():
+                    def on_cancelled():
+                        self.build_prog.stop()
+                        self.lbl_build_status.configure(text="Build cancelled.", text_color="#EF5350")
+                        self.btn_start_build.configure(state="normal")
+                        self.btn_cancel_build.configure(state="disabled")
+                    self.after(0, on_cancelled)
+                    return
+
+                def on_done():
+                    self.build_prog.stop()
+                    self.parent.engine.load_binary_index(final_path)
+                    self._refresh_status()
+                    self.lbl_build_status.configure(
+                        text=f"Build Complete! Indexed {builder.unique_count:,} numbers ({builder.current_pos:,} digits).",
+                        text_color="#4CAF50",
+                    )
+                    self.btn_start_build.configure(state="normal")
+                    self.btn_cancel_build.configure(state="disabled")
+                    messagebox.showinfo(
+                        "Build Complete",
+                        f"10-Digit Binary Index built and loaded successfully!\n\n"
+                        f"Scanned: {builder.current_pos:,} digits\n"
+                        f"Indexed: {builder.unique_count:,} unique numbers\n"
+                        f"File: {final_path.name}",
+                        parent=self,
+                    )
+
+                self.after(0, on_done)
+            except Exception as e:
+                err_msg = str(e)
+                def on_err():
+                    self.build_prog.stop()
+                    self.lbl_build_status.configure(text=f"Build failed: {err_msg}", text_color="#EF5350")
+                    self.btn_start_build.configure(state="normal")
+                    self.btn_cancel_build.configure(state="disabled")
+                    messagebox.showerror("Build Error", f"Failed to build binary index:\n{err_msg}", parent=self)
+
+                self.after(0, on_err)
+
+        self._build_thread = threading.Thread(target=worker, daemon=True)
+        self._build_thread.start()
+
+    def _on_cancel_build(self):
+        self._cancel_build_event.set()
+        self.btn_cancel_build.configure(state="disabled", text="Stopping...")
+        self.lbl_build_status.configure(text="Cancelling build...", text_color="#FF9800")
 
 
 class ResultDisplayManager:
@@ -342,6 +678,10 @@ class PiPhoneApp(ctk.CTk):
         self._msg_queue: queue.Queue = queue.Queue()
         self._is_searching = False
 
+        # Engine Mode & Benchmark Comparison State
+        self._engine_mode: SearchEngineMode = SearchEngineMode.STANDARD_ENGINE
+        self._compare_mode: bool = False
+
         # Main layout container
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -404,16 +744,66 @@ class PiPhoneApp(ctk.CTk):
             placeholder_text="Enter 1-10 digits...",
             justify="center",
             font=ctk.CTkFont(size=22, weight="bold"),
-            height=46,
+            height=44,
             validate="key",
             validatecommand=vcmd,
         )
-        self.number_entry.grid(row=0, column=0, columnspan=3, padx=16, pady=(8, 8), sticky="ew")
+        self.number_entry.grid(row=0, column=0, columnspan=3, padx=16, pady=(6, 4), sticky="ew")
         self.number_entry.bind("<KeyRelease>", lambda e: self._update_action_button_state())
+
+        # Search Engine Selector & Benchmark Compare Bar
+        self.engine_frame = ctk.CTkFrame(self.tab_dialer, fg_color="#1E1E1E", corner_radius=8)
+        self.engine_frame.grid(row=1, column=0, columnspan=3, padx=16, pady=(0, 4), sticky="ew")
+        self.engine_frame.grid_columnconfigure(0, weight=1)
+
+        # Segmented engine selector (Standard vs Binary Index)
+        self.seg_engine = ctk.CTkSegmentedButton(
+            self.engine_frame,
+            values=["Standard Live", "Binary Index (.piidx)"],
+            command=self._on_engine_mode_changed,
+            font=ctk.CTkFont(size=11, weight="bold"),
+            height=26,
+        )
+        self.seg_engine.set("Standard Live")
+        self.seg_engine.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 2))
+
+        # Sub-controls: Compare Both Checkbox, Index Status Pill, and Index Manager Button
+        ctrl_sub = ctk.CTkFrame(self.engine_frame, fg_color="transparent")
+        ctrl_sub.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 4))
+        ctrl_sub.grid_columnconfigure(1, weight=1)
+
+        self.chk_compare = ctk.CTkCheckBox(
+            ctrl_sub,
+            text="Compare Both",
+            font=ctk.CTkFont(size=11),
+            height=18,
+            command=self._on_compare_toggled,
+        )
+        self.chk_compare.grid(row=0, column=0, sticky="w")
+
+        self.lbl_index_status = ctk.CTkLabel(
+            ctrl_sub,
+            text=self._get_index_status_str(),
+            font=ctk.CTkFont(size=10),
+            text_color="#00E5FF",
+        )
+        self.lbl_index_status.grid(row=0, column=1, sticky="ew", padx=4)
+
+        self.btn_index_mgr = ctk.CTkButton(
+            ctrl_sub,
+            text="⚙️ Index",
+            width=62,
+            height=20,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#37474F",
+            hover_color="#455A64",
+            command=self._open_index_manager,
+        )
+        self.btn_index_mgr.grid(row=0, column=2, sticky="e")
 
         # Constrained dial pad layout for crisp smartphone proportions (padx=28)
         self.keypad_frame = ctk.CTkFrame(self.tab_dialer, fg_color="transparent")
-        self.keypad_frame.grid(row=1, column=0, columnspan=3, padx=28, pady=(2, 6), sticky="nsew")
+        self.keypad_frame.grid(row=2, column=0, columnspan=3, padx=28, pady=(1, 4), sticky="nsew")
         self.keypad_frame.grid_columnconfigure((0, 1, 2), weight=1)
         self.keypad_frame.grid_rowconfigure((0, 1, 2, 3), weight=1)
 
@@ -443,12 +833,12 @@ class PiPhoneApp(ctk.CTk):
                 text=text,
                 font=ctk.CTkFont(size=22, weight="bold"),
                 corner_radius=22,
-                height=48,
+                height=46,
                 fg_color=fg,
                 hover_color=hover,
                 command=cmd,
             )
-            btn.grid(row=r, column=c, padx=5, pady=4, sticky="nsew")
+            btn.grid(row=r, column=c, padx=5, pady=3, sticky="nsew")
 
         # Primary Action Button ("Find in Pi" <-> "Cancel")
         self.btn_action = ctk.CTkButton(
@@ -457,25 +847,25 @@ class PiPhoneApp(ctk.CTk):
             fg_color="#2E7D32",
             hover_color="#1B5E20",
             font=ctk.CTkFont(size=16, weight="bold"),
-            height=44,
+            height=42,
             command=self._on_primary_action,
             state="disabled",
         )
-        self.btn_action.grid(row=2, column=0, columnspan=3, padx=16, pady=(4, 6), sticky="ew")
+        self.btn_action.grid(row=3, column=0, columnspan=3, padx=16, pady=(3, 5), sticky="ew")
 
         # Results & Flanking Context Display Container
         self.result_frame = ctk.CTkFrame(self.tab_dialer, fg_color="#1E1E1E", corner_radius=8)
-        self.result_frame.grid(row=3, column=0, columnspan=3, padx=16, pady=(2, 8), sticky="ew")
+        self.result_frame.grid(row=4, column=0, columnspan=3, padx=16, pady=(1, 6), sticky="ew")
         self.result_frame.grid_columnconfigure(0, weight=1)
 
         # Fixed-height container frame for the mixed-font result line (prevents vertical clipping)
         self.result_txt_container = ctk.CTkFrame(
             self.result_frame,
             fg_color="#1E1E1E",
-            height=54,
+            height=50,
             corner_radius=0,
         )
-        self.result_txt_container.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        self.result_txt_container.grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 2))
         self.result_txt_container.grid_propagate(False)
         self.result_txt_container.grid_columnconfigure(0, weight=1)
         self.result_txt_container.grid_rowconfigure(0, weight=1)
@@ -508,7 +898,7 @@ class PiPhoneApp(ctk.CTk):
             fg="gray75",
             bg="#1E1E1E",
         )
-        self.lbl_position.grid(row=1, column=0, sticky="ew", padx=6, pady=(2, 2))
+        self.lbl_position.grid(row=1, column=0, sticky="ew", padx=6, pady=(1, 1))
 
         # Animated indeterminate progress bar pulsing directly above the live elapsed timer
         self.prog_bar = ctk.CTkProgressBar(
@@ -528,7 +918,123 @@ class PiPhoneApp(ctk.CTk):
             fg="gray50",
             bg="#1E1E1E",
         )
-        self.lbl_telemetry.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
+        self.lbl_telemetry.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 3))
+
+        # Comparison Card (Side-by-side performance benchmarking)
+        self.compare_card = ctk.CTkFrame(self.result_frame, fg_color="#181818", corner_radius=6)
+        self.compare_card.grid(row=4, column=0, sticky="ew", padx=6, pady=(2, 5))
+        self.compare_card.grid_columnconfigure(0, weight=1)
+
+        self.lbl_comp_title = ReadonlySelectableEntry(
+            self.compare_card,
+            text="⚡ Side-by-Side Engine Comparison",
+            font=("Segoe UI", 10, "bold"),
+            fg="#00E5FF",
+            bg="#181818",
+            justify="center",
+        )
+        self.lbl_comp_title.grid(row=0, column=0, sticky="ew", padx=4, pady=(3, 1))
+
+        self.lbl_comp_std = ReadonlySelectableEntry(
+            self.compare_card,
+            text="",
+            font=("Segoe UI", 9),
+            fg="gray80",
+            bg="#181818",
+            justify="left",
+        )
+        self.lbl_comp_std.grid(row=1, column=0, sticky="ew", padx=6, pady=1)
+
+        self.lbl_comp_bin = ReadonlySelectableEntry(
+            self.compare_card,
+            text="",
+            font=("Segoe UI", 9),
+            fg="#4CAF50",
+            bg="#181818",
+            justify="left",
+        )
+        self.lbl_comp_bin.grid(row=2, column=0, sticky="ew", padx=6, pady=1)
+
+        self.lbl_comp_speed = ReadonlySelectableEntry(
+            self.compare_card,
+            text="",
+            font=("Segoe UI", 9, "bold"),
+            fg="#FFD54F",
+            bg="#181818",
+            justify="left",
+        )
+        self.lbl_comp_speed.grid(row=3, column=0, sticky="ew", padx=6, pady=(1, 3))
+        self.compare_card.grid_remove()
+
+    # =========================================================================
+    # Engine Selection, Benchmark Comparison & Index Management
+    # =========================================================================
+    def _get_index_status_str(self) -> str:
+        """Returns a compact status string describing the currently loaded binary index."""
+        if self.engine.binary_index is not None:
+            mode_str = "Straggler" if self.engine.binary_index.mode == 1 else "Direct"
+            scanned_m = self.engine.binary_index.max_pi_digit_scanned / 1_000_000
+            return f"● Idx: {mode_str} ({scanned_m:.0f}M)"
+        return "○ Idx: None"
+
+    def _refresh_engine_ui(self):
+        """Updates the binary index status label and colors in the Dialer tab."""
+        status_txt = self._get_index_status_str()
+        color = "#00E5FF" if self.engine.binary_index is not None else "gray50"
+        self.lbl_index_status.configure(text=status_txt, text_color=color)
+
+    def _on_engine_mode_changed(self, value: str):
+        """Handles user changing the segmented engine switch."""
+        if "Binary" in value:
+            self._engine_mode = SearchEngineMode.BINARY_INDEX_ENGINE
+        else:
+            self._engine_mode = SearchEngineMode.STANDARD_ENGINE
+
+    def _on_compare_toggled(self):
+        """Handles toggling of the 'Compare Both' checkbox."""
+        self._compare_mode = bool(self.chk_compare.get())
+
+    def _open_index_manager(self):
+        """Opens the 10-Digit Binary Index Manager dialog modal."""
+        dialog = IndexManagerDialog(self)
+        dialog.grab_set()
+
+    def _on_compare_completed(
+        self,
+        res_std: Optional[SearchResult],
+        res_bin: Optional[SearchResult],
+        speedup: float,
+    ):
+        """Displays side-by-side benchmark comparison metrics in the compare card."""
+        self.compare_card.grid()
+
+        if res_std is not None:
+            std_time = format_latency(res_std.elapsed_seconds)
+            self.lbl_comp_std.configure(
+                text=f"Standard: Digit #{res_std.position:,} in {std_time} ({res_std.source})"
+            )
+        else:
+            self.lbl_comp_std.configure(text="Standard: Search stopped / not found")
+
+        if res_bin is not None:
+            bin_time = format_latency(res_bin.elapsed_seconds)
+            self.lbl_comp_bin.configure(
+                text=f"Binary Idx: Digit #{res_bin.position:,} in {bin_time} ({res_bin.source})"
+            )
+        else:
+            self.lbl_comp_bin.configure(text="Binary Idx: Search stopped / not found")
+
+        if speedup > 0:
+            self.lbl_comp_speed.configure(
+                text=f"⚡ Speedup: Binary Index is {speedup:,.1f}x faster!"
+            )
+        else:
+            self.lbl_comp_speed.configure(text="⚡ Speedup: Both engines identical or N/A")
+
+        # Update primary dialer result display with best result
+        best_res = res_bin or res_std
+        if best_res is not None:
+            self._on_search_completed(best_res, is_comparison=True)
 
     # =========================================================================
     # Tab 2: Search History
@@ -647,6 +1153,10 @@ class PiPhoneApp(ctk.CTk):
             # Compact metadata formatting for 390px window
             if "Index Cache" in source or "Sorted Index" in source:
                 src_label = "Cache"
+            elif "Binary Index" in source:
+                src_label = "Binary Idx"
+            elif "Fallback" in source:
+                src_label = "Idx Fallback"
             elif "Calculated" in source:
                 new_d = entry.get("new_digits_calculated", 0)
                 if new_d > 0:
@@ -659,7 +1169,7 @@ class PiPhoneApp(ctk.CTk):
             if elapsed >= 1.0:
                 time_str = f"{elapsed:.1f}s"
             else:
-                time_str = f"{elapsed*1000:.1f}ms"
+                time_str = format_latency(elapsed)
 
             if len(ts) >= 16 and ts[4] == "-" and ts[7] == "-":
                 ts_compact = f"{ts[5:7]}/{ts[8:10]} {ts[11:16]}"
@@ -694,7 +1204,10 @@ class PiPhoneApp(ctk.CTk):
             btn_view.grid(row=0, column=1, padx=(4, 10), pady=(5, 0), sticky="e")
 
             # Row 1, Col 0 (columnspan=2): Context snippet (full card width)
-            context_text = f"Context: {pre} [{tgt}] {flw}"
+            if not pre and not flw:
+                context_text = f"Target: [{tgt}]"
+            else:
+                context_text = f"Context: {pre} [{tgt}] {flw}"
             lbl_context = ReadonlySelectableEntry(
                 card,
                 text=context_text,
@@ -788,6 +1301,7 @@ class PiPhoneApp(ctk.CTk):
             return
         self.number_entry.delete(0, "end")
         self._update_action_button_state()
+        self.compare_card.grid_remove()
         self.lbl_preceding.configure(text="")
         self.lbl_target.configure(text="—")
         self.lbl_following.configure(text="")
@@ -892,6 +1406,7 @@ class PiPhoneApp(ctk.CTk):
         self.lbl_following.configure(text="")
         self.lbl_position.configure(text="Searching decimal expansion of Pi...")
         self.lbl_telemetry.configure(text="Querying index cache...")
+        self.compare_card.grid_remove()
 
         # Start indeterminate progress bar
         self.prog_bar.grid()
@@ -949,18 +1464,34 @@ class PiPhoneApp(ctk.CTk):
             response_event.wait()
             return response_holder["action"]
 
-        result = self.engine.search(
-            query=query,
-            cancel_event=self._cancel_event,
-            progress_callback=progress_cb,
-            checkpoint_callback=checkpoint_cb,
-        )
-
-        if self._cancel_event.is_set() or result is None:
-            self._msg_queue.put(("cancelled", None))
+        if self._compare_mode:
+            res_std, res_bin, speedup = self.engine.compare_engines(
+                query=query,
+                cancel_event=self._cancel_event,
+                progress_callback=progress_cb,
+                checkpoint_callback=checkpoint_cb,
+            )
+            if self._cancel_event.is_set():
+                self._msg_queue.put(("cancelled", None))
+            else:
+                best_res = res_bin or res_std
+                if best_res is not None:
+                    self.engine.log_history(best_res)
+                self._msg_queue.put(("compare_completed", (res_std, res_bin, speedup)))
         else:
-            self.engine.log_history(result)
-            self._msg_queue.put(("found", result))
+            result = self.engine.search(
+                query=query,
+                cancel_event=self._cancel_event,
+                progress_callback=progress_cb,
+                checkpoint_callback=checkpoint_cb,
+                engine_mode=self._engine_mode,
+            )
+
+            if self._cancel_event.is_set() or result is None:
+                self._msg_queue.put(("cancelled", None))
+            else:
+                self.engine.log_history(result)
+                self._msg_queue.put(("found", result))
 
     def _poll_queue(self):
         """Polls the inter-thread message queue for UI events and modal triggers."""
@@ -1003,6 +1534,9 @@ class PiPhoneApp(ctk.CTk):
                     )
                 elif msg_type == "found":
                     self._on_search_completed(payload)
+                elif msg_type == "compare_completed":
+                    res_std, res_bin, speedup = payload
+                    self._on_compare_completed(res_std, res_bin, speedup)
                 elif msg_type == "cancelled":
                     self._on_search_cancelled()
         except queue.Empty:
@@ -1167,7 +1701,7 @@ class PiPhoneApp(ctk.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_search_completed(self, result: SearchResult):
+    def _on_search_completed(self, result: SearchResult, is_comparison: bool = False):
         """Updates the dialer UI and history tab when a match is found."""
         self._is_searching = False
         self.prog_bar.stop()
@@ -1189,8 +1723,11 @@ class PiPhoneApp(ctk.CTk):
         if result.new_digits_calculated > 0:
             source_desc = f"Source: {result.source} ({result.elapsed_seconds:.2f}s)"
         else:
-            source_desc = f"Source: {result.source} ({result.elapsed_seconds * 1000:.1f}ms)"
+            source_desc = f"Source: {result.source} ({format_latency(result.elapsed_seconds)})"
         self.lbl_telemetry.configure(text=source_desc)
+
+        if not is_comparison:
+            self.compare_card.grid_remove()
 
         # Refresh history tab content & total digits banner
         self._refresh_history_tab()

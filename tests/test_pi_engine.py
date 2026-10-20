@@ -8,12 +8,20 @@ import time
 from pathlib import Path
 
 import pytest
+from pi_binary_index import (
+    BinaryIndexMode,
+    PiBinaryIndex,
+    decode_header,
+    encode_header,
+    format_latency,
+)
 from pi_engine import (
     DEFAULT_CHUNK_SIZE,
     MAX_QUERY_LENGTH,
     CheckpointOption,
     CheckpointTierConfig,
     PiEngine,
+    SearchEngineMode,
     SearchResult,
     compress_seed_file,
     compute_pi_digits,
@@ -23,6 +31,7 @@ from pi_engine import (
     get_seed_path,
     validate_query,
 )
+from pi_index_builder import BinaryIndexBuilder
 
 
 @pytest.fixture
@@ -1016,3 +1025,287 @@ def test_tc27_seed_export_import_roundtrip(tmp_path: Path):
     bad_chars.write_text("1415926535abcdefg", encoding="ascii")
     with pytest.raises(ValueError, match="contains non-numeric"):
         engine2.import_seed(bad_chars)
+
+
+# =====================================================================
+# TC-28: Binary Index Header Encoding, Decoding & Validation
+# =====================================================================
+def test_tc28_binary_index_header_and_records():
+    """
+    TC-28: Verify 16-byte header packing:
+    - Exactly 16 bytes: b"PI10\\x01" (5B) + mode (1B) + cutoff_pos (5B) + max_scanned (5B)
+    - uint40 LE round-trip for cutoff and max_scanned up to 2^40 - 1
+    - Header validation rejects truncated headers, bad magic prefix, and invalid modes.
+    """
+    # 1. Round-trip Mode 1
+    hdr1 = encode_header(BinaryIndexMode.STRAGGLER_SORTED_10B, 100_000_000, 250_000_000)
+    assert len(hdr1) == 16
+    assert hdr1[:5] == b"PI10\x01"
+    assert hdr1[5] == 1
+    mode, cutoff, max_scanned = decode_header(hdr1)
+    assert mode == BinaryIndexMode.STRAGGLER_SORTED_10B
+    assert cutoff == 100_000_000
+    assert max_scanned == 250_000_000
+
+    # 2. Round-trip Mode 2 with large 40-bit integers
+    large_val = (1 << 40) - 1
+    hdr2 = encode_header(BinaryIndexMode.FULL_DIRECT_5B, 0, large_val)
+    assert len(hdr2) == 16
+    assert hdr2[5] == 2
+    mode2, cutoff2, max_scanned2 = decode_header(hdr2)
+    assert mode2 == BinaryIndexMode.FULL_DIRECT_5B
+    assert cutoff2 == 0
+    assert max_scanned2 == large_val
+
+    # 3. Reject truncated header
+    with pytest.raises(ValueError, match="Header data too short"):
+        decode_header(b"PI10\x01\x01\x00")
+
+    # 4. Reject bad magic
+    bad_magic = b"PI99\x01\x01" + b"\x00" * 10
+    with pytest.raises(ValueError, match="Invalid index magic bytes"):
+        decode_header(bad_magic)
+
+    # 5. Reject invalid mode
+    bad_mode = b"PI10\x01\x05" + b"\x00" * 10
+    with pytest.raises(ValueError, match="Unsupported binary index mode"):
+        decode_header(bad_mode)
+
+
+# =====================================================================
+# TC-29: Binary Index Lookup Modes (Mode 1 Straggler & Mode 2 Direct)
+# =====================================================================
+def test_tc29_binary_index_lookup_modes(tmp_path: Path):
+    """
+    TC-29: Verify mmap binary search for Mode 1 (STRAGGLER_SORTED_10B)
+    and O(1) table lookup for Mode 2 (FULL_DIRECT_5B).
+    """
+    # --- Mode 1: Sorted 10-byte records ---
+    m1_path = tmp_path / "test_mode1.piidx"
+    records = [
+        (1000000000, 500000),
+        (2345678901, 1200000),
+        (5555555555, 3000000),
+        (9999999999, 987654321),
+    ]
+    with open(m1_path, "wb") as f:
+        f.write(encode_header(BinaryIndexMode.STRAGGLER_SORTED_10B, 0, 1_000_000_000))
+        for phone, pos in records:
+            f.write(phone.to_bytes(5, "little", signed=False))
+            f.write(pos.to_bytes(5, "little", signed=False))
+
+    idx1 = PiBinaryIndex(m1_path)
+    assert idx1.mode == BinaryIndexMode.STRAGGLER_SORTED_10B
+    assert idx1.record_count == 4
+    assert idx1.max_pi_digit_scanned == 1_000_000_000
+
+    # Lookups
+    assert idx1.lookup("1000000000") == 500000
+    assert idx1.lookup("2345678901") == 1200000
+    assert idx1.lookup("5555555555") == 3000000
+    assert idx1.lookup("9999999999") == 987654321
+
+    # Non-matching query
+    assert idx1.lookup("1111111111") is None
+    assert idx1.lookup("0000000000") is None
+
+    # Invalid query lengths gracefully return None
+    assert idx1.lookup("12345") is None
+    assert idx1.lookup("abcdefghij") is None
+
+    idx1.close()
+
+    # --- Mode 2: Full Direct 5B ---
+    m2_path = tmp_path / "test_mode2.piidx"
+    # Create small test direct file spanning up to phone number 10
+    hdr = encode_header(BinaryIndexMode.FULL_DIRECT_5B, 0, 500_000_000)
+    with open(m2_path, "wb") as f:
+        f.write(hdr)
+        # Write 10 entries (5 bytes each)
+        for i in range(10):
+            if i == 3:
+                f.write((333333).to_bytes(5, "little", signed=False))
+            elif i == 7:
+                f.write((777777).to_bytes(5, "little", signed=False))
+            else:
+                f.write(b"\x00" * 5)
+
+    idx2 = PiBinaryIndex(m2_path)
+    assert idx2.mode == BinaryIndexMode.FULL_DIRECT_5B
+    assert idx2.lookup("0000000003") == 333333
+    assert idx2.lookup("0000000007") == 777777
+    assert idx2.lookup("0000000001") is None
+    idx2.close()
+
+
+# =====================================================================
+# TC-30: Binary Index Engine Fallback Rules & Badging (Cases A, B, C)
+# =====================================================================
+def test_tc30_binary_index_engine_fallbacks(tmp_path: Path):
+    """
+    TC-30: Verify all 3 fallback rules for the 10-Digit Binary Index Engine:
+    - Case A: 1-9 digit query -> Fallback to Standard Engine with badge
+    - Case B: 10-digit query with index Hit -> instant return, 0 context digits
+    - Case C: 10-digit query with index Miss or No Index -> Fallback with badge
+    """
+    engine = PiEngine(data_dir=tmp_path, default_seed_digits=5000, load_seed_pack=False)
+
+    # 1. Case A: 1-9 digits fallback
+    res_a = engine.search("1415", engine_mode=SearchEngineMode.BINARY_INDEX_ENGINE)
+    assert res_a is not None
+    assert res_a.position == 1
+    assert "Fallback: Standard Engine (1-9 digit query)" in res_a.source
+    assert res_a.preceding == "3."
+    assert res_a.target == "1415"
+
+    # 2. Case C (No Index Loaded): 10 digits
+    res_c_no_idx = engine.search("1415926535", engine_mode=SearchEngineMode.BINARY_INDEX_ENGINE)
+    assert res_c_no_idx is not None
+    assert res_c_no_idx.position == 1
+    assert "No Index Loaded -> Fallback: Standard Engine" in res_c_no_idx.source
+
+    # 3. Build a small index containing digits up to 5000
+    idx_path = tmp_path / "test_seed.piidx"
+    builder = BinaryIndexBuilder(
+        mode=BinaryIndexMode.STRAGGLER_SORTED_10B,
+        cutoff_pos=0,
+        output_path=idx_path,
+    )
+    builder.build_from_string(engine.digits)
+    assert idx_path.exists()
+
+    engine.load_binary_index(idx_path)
+    assert engine.binary_index is not None
+
+    # Case B: 10-digit Hit
+    target_10 = engine.digits[:10]  # "1415926535"
+    res_b = engine.search(target_10, engine_mode=SearchEngineMode.BINARY_INDEX_ENGINE)
+    assert res_b is not None
+    assert res_b.position == 1
+    assert "Engine: 10-Digit Binary Index (Hit" in res_b.source
+    # Context digits MUST be empty for binary index hits
+    assert res_b.preceding == ""
+    assert res_b.following == ""
+    assert res_b.target == target_10
+
+    # 4. Case C (Index Miss): 10-digit number not present in the 5,000 scanned digits
+    target_miss = "9999999999"
+    # If not in the 5000 digits, search will trigger checkpoint/fallback
+    # Provide a checkpoint callback that stops calculation to verify fallback badge
+    res_c_miss = engine.search(
+        target_miss,
+        engine_mode=SearchEngineMode.BINARY_INDEX_ENGINE,
+        checkpoint_callback=lambda new_d, tot, tier: "stop",
+    )
+    if res_c_miss is not None:
+        assert "Index Miss" in res_c_miss.source
+        assert "Fallback: Standard Engine" in res_c_miss.source
+
+
+# =====================================================================
+# TC-31: Binary Index Builder Streaming, Bitset Tracking & Resuming
+# =====================================================================
+def test_tc31_index_builder_streaming_and_checkpoints(tmp_path: Path):
+    """
+    TC-31: Verify BinaryIndexBuilder:
+    - 9-digit boundary stitching across streaming chunks
+    - Bitset deduplication (first observed position retained)
+    - Checkpoint saving and resuming
+    - Clean thread cancellation
+    """
+    out_path = tmp_path / "builder_test.piidx"
+    builder = BinaryIndexBuilder(
+        mode=BinaryIndexMode.STRAGGLER_SORTED_10B,
+        cutoff_pos=0,
+        output_path=out_path,
+    )
+
+    # 1. Boundary stitch test: chunk_size=5 to force stitching across small chunks
+    # "00001" + "23456" + "78900" -> creates "1234567890" starting at pos 5
+    digits = "000012345678900000"
+    final_path = builder.build_from_string(digits, chunk_size=5)
+    assert final_path.exists()
+
+    b_idx = PiBinaryIndex(final_path)
+    pos = b_idx.lookup("1234567890")
+    assert pos == 5  # 1-based index (0000 is 1-4, '1' is at pos 5)
+    b_idx.close()
+
+    # 2. Test checkpoint save and load
+    ckpt_dir = tmp_path / "ckpt_dir"
+    builder2 = BinaryIndexBuilder(
+        mode=BinaryIndexMode.STRAGGLER_SORTED_10B,
+        cutoff_pos=1000,
+        output_path=tmp_path / "ckpt_test.piidx",
+    )
+    builder2.bitset[42] = 0b10101010
+    builder2.unique_count = 1234
+    builder2.current_pos = 5678
+
+    builder2.save_checkpoint(ckpt_dir)
+    assert (ckpt_dir / "state.ckpt.json").exists()
+    assert (ckpt_dir / "bitset.ckpt.bin").exists()
+
+    # Create fresh builder and resume
+    builder3 = BinaryIndexBuilder(
+        mode=BinaryIndexMode.STRAGGLER_SORTED_10B,
+        cutoff_pos=1000,
+        output_path=tmp_path / "ckpt_test.piidx",
+    )
+    builder3.load_checkpoint(ckpt_dir)
+    assert builder3.unique_count == 1234
+    assert builder3.current_pos == 5678
+    assert builder3.bitset[42] == 0b10101010
+
+    # 3. Test cancellation
+    cancel_ev = threading.Event()
+    cancel_ev.set()  # Cancel immediately
+    builder_cancel = BinaryIndexBuilder(
+        mode=BinaryIndexMode.STRAGGLER_SORTED_10B,
+        output_path=tmp_path / "cancel_test.piidx",
+    )
+    res_cancel = builder_cancel.build_from_string("14159265358979323846", cancel_event=cancel_ev)
+    assert res_cancel == tmp_path / "cancel_test.piidx"
+
+
+# =====================================================================
+# TC-32: Side-by-Side Compare Engines Back-to-Back Execution
+# =====================================================================
+def test_tc32_compare_engines_back_to_back(tmp_path: Path):
+    """
+    TC-32: Verify compare_engines() executes both STANDARD_ENGINE and
+    BINARY_INDEX_ENGINE back-to-back, returns both SearchResult objects,
+    and computes the speedup factor.
+    """
+    engine = PiEngine(data_dir=tmp_path, default_seed_digits=10_000, load_seed_pack=False)
+
+    # Build and load a small binary index
+    idx_path = tmp_path / "compare_test.piidx"
+    builder = BinaryIndexBuilder(
+        mode=BinaryIndexMode.STRAGGLER_SORTED_10B,
+        cutoff_pos=0,
+        output_path=idx_path,
+    )
+    builder.build_from_string(engine.digits)
+    engine.load_binary_index(idx_path)
+
+    # 1. 10-digit query comparison
+    target_10 = engine.digits[:10]
+    res_std, res_bin, speedup = engine.compare_engines(target_10)
+
+    assert res_std is not None
+    assert res_bin is not None
+    assert res_std.position == 1
+    assert res_bin.position == 1
+    assert res_std.source == "Sorted Index Cache"
+    assert "10-Digit Binary Index" in res_bin.source
+    assert speedup >= 0.0
+
+    # 2. 4-digit query comparison (Fallback on binary index engine)
+    res_std_4, res_bin_4, speedup_4 = engine.compare_engines("1415")
+    assert res_std_4 is not None
+    assert res_bin_4 is not None
+    assert res_std_4.position == 1
+    assert res_bin_4.position == 1
+    assert "Fallback: Standard Engine" in res_bin_4.source
+

@@ -85,6 +85,18 @@ This document outlines completed milestones, planned enhancements, architectural
   * Subprocess calculation takes `old_len`, writing only the newly computed $\sim 2\text{MB}$ delta slice to disk and appending to `pi_digits.txt`, eliminating multi-hundred-megabyte IPC transfer bottlenecks.
   * Cleaned telemetry status line to eliminate duplicate `"Calculating Pi... "` prefix and fit comfortably inside 390px.
 
+### FB-15: Modular Digit Search Architecture & 10-Digit Binary Index Engine (`.piidx`)
+* **Status**: **Completed (v2.4)**
+* **Implementation**:
+  * Modular strategy dispatcher (`SearchEngineMode.STANDARD_ENGINE` and `SearchEngineMode.BINARY_INDEX_ENGINE`) allowing instant switching.
+  * 16-byte dual-format `.piidx` binary specification:
+    * Mode 1 (`STRAGGLER_SORTED_10B`): Sorted 10-byte records (`[phone_int: uint40][pi_start_pos: uint40]`) searched via `mmap` binary search ($O(\log N)$) in microseconds.
+    * Mode 2 (`FULL_DIRECT_5B`): $O(1)$ direct array lookup table at offset `16 + (phone_int * 5)`.
+  * Comprehensive fallback rules: Case A (1–9 digits fallback with badge), Case B (10 digits hit without context digits), and Case C (10 digits miss/no index fallback).
+  * Streaming Index Builder (`pi_index_builder.py`): 1.25 GB bitset tracking ($10^{10}$ bits), 9-digit boundary stitching across streaming chunks, and atomic crash checkpoints (`bitset.ckpt.bin` + `state.ckpt.json`).
+  * Index Manager GUI Dialog (`IndexManagerDialog` in `piphone.py`) to inspect, load, unload, and build `.piidx` files.
+  * Side-by-side performance comparison mode (`Compare Both` checkbox) executing back-to-back benchmark runs and reporting speedup factor.
+
 ---
 
 ## 2. Active Backlog Items

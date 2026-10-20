@@ -8,6 +8,11 @@
 
 | Feature | Description |
 |---------|-------------|
+| **Modular Engine Selector** | Segmented button on the Dialer tab allowing instantaneous toggling between `Standard Live` calculation and `Binary Index (.piidx)`. |
+| **10-Digit Binary Index Engine** | Microsecond ($< 1\text{ms}$) lookups via memory-mapped `.piidx` files with dual-mode support (Mode 1: sorted 10-byte stragglers; Mode 2: $O(1)$ direct 5-byte array). |
+| **Side-by-Side Comparison Mode** | `Compare Both` checkbox running both search engines back-to-back, displaying relative latencies and the speedup factor ($\text{X.X}\times$ faster ⚡). |
+| **Index Manager Dialog** | Built-in GUI manager (`⚙️ Index`) to inspect active index metadata, load/unload `.piidx` files, or build new indices with real-time throughput metrics. |
+| **Streaming Index Builder** | High-performance CLI and GUI builder (`pi_index_builder.py`) featuring 1.25 GB bitset tracking ($10^{10}$ bits), 9-digit boundary stitching, and atomic crash checkpoints. |
 | **Pi Dialer Tab** | Keypad (`0–9`, `CLR`, `⌫`), numeric input (1–10 digits with strict 11th-digit block), and full keyboard/numpad shortcuts. |
 | **Smartphone Dialer Form Factor** | Sleek 390x720 aspect ratio, tactile phone-proportioned keypad (`corner_radius=22`, `22pt bold`), and dynamic target font scaling (26pt/22pt/19pt) preventing horizontal clipping. |
 | **Bundled 100M Seed Pack** | Bundled compressed 100,000,000-digit $\pi$ seed pack (`seed/pi_100m.zst`, 40.56 MB) enabling instantaneous (< 20ms) resolution for 1-to-7 digit numbers right out of the box. |

@@ -238,6 +238,40 @@ $$\frac{1}{\pi} = 12 \sum_{k=0}^{\infty} \frac{(-1)^k (6k)! (545140134k + 135914
    * Upon each expansion from `old_len` to `len(digits)`, the engine scans `max(0, old_len - 3)` through `len(digits) - 3` to index boundary-straddling 4-digit prefixes without full table recomputation.
    * Maintains sorted order via Timsort.
 
+### 3.4 10-Digit Binary Index Engine & Dual-Format Specification (`.piidx`)
+PiPhone v2.4 introduces a high-performance **10-Digit Binary Index Engine** alongside the existing standard engine, optimized for instantaneous ($< 1\text{ms}$) resolution of 10-digit phone number queries without memory overhead.
+
+#### 16-Byte Binary Index Header (`pi_binary_index.py`)
+All `.piidx` files begin with an immutable 16-byte binary header:
+```
+Offset  Size  Type       Field Name              Description
+0       5B    bytes      magic                   b"PI10\x01" (format identifier)
+5       1B    uint8      mode                    1 = STRAGGLER_SORTED_10B, 2 = FULL_DIRECT_5B
+6       5B    uint40 LE  cutoff_pos              Digits checked in local seed before binary search
+11      5B    uint40 LE  max_pi_digit_scanned    Total digits scanned to construct index
+```
+
+#### Dual Modes:
+* **Mode 1 (`STRAGGLER_SORTED_10B`)**:
+  * Sorted 10-byte records: `[phone_int: uint40 LE (5B)][pi_start_pos: uint40 LE (5B)]`.
+  * Queried via `mmap` binary search ($O(\log N)$) in $\approx 10\text{--}50\,\mu\text{s}$.
+  * Only stores unique 10-digit sequences discovered beyond `cutoff_pos`.
+* **Mode 2 (`FULL_DIRECT_5B`)**:
+  * $O(1)$ direct array indexed by phone integer: lookup at file offset $16 + (\text{phone\_int} \times 5)$.
+  * 5 bytes per entry (uint40 LE 1-based position). Returns `None` if value is 0.
+
+#### Automatic Fallback Rules:
+* **Case A (1–9 digits)**: Binary Index only indexes 10-digit phone numbers. Queries with 1–9 digits automatically fall back to `STANDARD_ENGINE` with badge `[Fallback: Standard Engine (1-9 digit query)]`.
+* **Case B (10 digits, Hit)**: Returns exact decimal position in microseconds. Context preceding and following digits are empty strings (`""`) for maximum compactness and speed. Source badge indicates `[Engine: 10-Digit Binary Index (Hit in X.XX µs/ms)]`.
+* **Case C (10 digits, Miss or No Index)**: If no index is loaded or the query is not in the indexed range, automatically falls back to `STANDARD_ENGINE` with badge `[Index Miss (Scanned up to Digit #X) -> Fallback: Standard Engine]` or `[No Index Loaded -> Fallback: Standard Engine]`.
+
+### 3.5 Streaming Index Builder (`pi_index_builder.py`)
+* **1.25 GB Bitset Tracking**: Allocates $10^{10}$ bits in a `bytearray(1_250_000_000)` (~17ms on 64-bit systems) to guarantee first-occurrence position tracking in $O(1)$ time.
+* **Rolling Integer Window & 9-Digit Boundary Stitch**: Maintains a rolling integer window via `window = ((window % 1_000_000_000) * 10) + digit` across streaming chunks, ensuring no sequence straddling chunk boundaries is missed.
+* **Universal Stream Ingestion**: Can build directly from local seed strings, `.txt` files, compressed archives (`.zst`, `.gz`), or y-cruncher output directories.
+* **Atomic Checkpointing**: Supports pause/resume via `save_checkpoint()` and `load_checkpoint()`, persisting `bitset.ckpt.bin` and `state.ckpt.json`.
+* **GUI Index Manager**: Dedicated management modal (`IndexManagerDialog`) to inspect index metadata, load/unload `.piidx` files, or build new indices with real-time throughput metrics.
+
 ---
 
 ## 4. Concurrency & Thread-Safety Model
@@ -264,14 +298,24 @@ PiPhone/
 |-- data/
 |   |-- pi_digits.txt          # Raw ASCII stream of calculated pi digits (excluding "3.")
 |   |-- pi_index.json           # Persisted sorted index (queries + prefix offsets)
-|   +-- search_history.json     # Search history log
+|   |-- search_history.json     # Search history log
+|   +-- pi_10digit.piidx        # Optional 10-Digit Binary Index
+|-- seed/
+|   +-- pi_seed.zst             # Bundled 100M-digit compressed seed pack
+|-- dist/
+|   |-- PiPhone.exe             # PyInstaller standalone executable
+|   +-- seed/
+|       +-- pi_seed.zst         # Visible local seed distribution
 |-- tests/
 |   |-- __init__.py
-|   +-- test_pi_engine.py       # Full pytest suite covering TC-01 through TC-07
-|-- piphone.py                  # Main CustomTkinter UI application
-|-- pi_engine.py                # Core calculation, indexing, and search engine
+|   |-- test_pi_engine.py       # Full pytest suite covering TC-01 through TC-32
+|   +-- test_ui.py              # CustomTkinter UI & selectable entry unit tests
+|-- piphone.py                  # Main CustomTkinter UI application & Index Manager Dialog
+|-- pi_engine.py                # Core calculation, modular engines & benchmark comparison
+|-- pi_binary_index.py          # .piidx reader & binary search mmap implementation
+|-- pi_index_builder.py         # 1.25 GB streaming index builder with crash checkpoints
 |-- PROJECT_DEFINITION.md       # Complete system architecture and spec
-|-- TEST_PLAN.md                # Comprehensive test cases and verification matrix
+|-- TEST_PLAN.md                # Comprehensive test cases and verification matrix (TC-01..TC-32)
 |-- FEATURE_BACKLOG.md          # Future roadmap and prioritized backlog
 |-- requirements.txt            # Package dependencies
 +-- requirements.md             # Dependency documentation
