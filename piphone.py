@@ -202,8 +202,8 @@ class ResultDisplayManager:
         self.txt.configure(state="normal")
         self.txt.delete("1.0", "end")
         self.txt.tag_configure("center", justify="center")
-        self.txt.tag_configure("context", font=("Segoe UI", 13), foreground="#9E9E9E")
-        self.txt.tag_configure("target", font=("Segoe UI", 24, "bold"), foreground="#4CAF50")
+        self.txt.tag_configure("context", font=("Segoe UI", 14), foreground="#9E9E9E", offset=4)
+        self.txt.tag_configure("target", font=("Segoe UI", 26, "bold"), foreground="#4CAF50")
 
         # Assemble formatted result with context styling
         if self.preceding:
@@ -271,6 +271,7 @@ class ReadonlySelectableEntry(tk.Entry):
         self.configure(state="normal")
         self.delete(0, "end")
         self.insert(0, text)
+        self.xview_moveto(0)
         self.configure(state="readonly")
 
     def configure(self, **kwargs):
@@ -300,8 +301,8 @@ class PiPhoneApp(ctk.CTk):
 
         # Window configuration
         self.title("PiPhone")
-        self.geometry("440x730")
-        self.minsize(400, 680)
+        self.geometry("460x700")
+        self.minsize(440, 620)
 
         # Core engine & concurrency
         self.engine = PiEngine(data_dir="data", default_seed_digits=100_000_000, load_seed_pack=True)
@@ -429,10 +430,23 @@ class PiPhoneApp(ctk.CTk):
         self.result_frame.grid(row=6, column=0, columnspan=3, padx=10, pady=(4, 10), sticky="ew")
         self.result_frame.grid_columnconfigure(0, weight=1)
 
+        # Fixed-height container frame for the mixed-font result line (prevents vertical clipping)
+        self.result_txt_container = ctk.CTkFrame(
+            self.result_frame,
+            fg_color="#1E1E1E",
+            height=56,
+            corner_radius=0,
+        )
+        self.result_txt_container.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        self.result_txt_container.grid_propagate(False)
+        self.result_txt_container.grid_columnconfigure(0, weight=1)
+        self.result_txt_container.grid_rowconfigure(0, weight=1)
+
         # Interactive, mouse-selectable Pi sequence display (borderless tk.Text with tags)
         self.txt_result = tk.Text(
-            self.result_frame,
-            height=2,
+            self.result_txt_container,
+            height=1,
+            font=("Segoe UI", 26, "bold"),
             bg="#1E1E1E",
             relief="flat",
             highlightthickness=0,
@@ -441,7 +455,7 @@ class PiPhoneApp(ctk.CTk):
             wrap="none",
             insertwidth=0,
         )
-        self.txt_result.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 2))
+        self.txt_result.grid(row=0, column=0, sticky="nsew", ipady=4)
 
         self.result_manager = ResultDisplayManager(self.txt_result)
         self.lbl_preceding = _ResultPartProxy(self.result_manager, "preceding")
@@ -534,6 +548,7 @@ class PiPhoneApp(ctk.CTk):
             card = ctk.CTkFrame(self.history_list, fg_color="#232323", corner_radius=6)
             card.pack(fill="x", padx=4, pady=4)
             card.grid_columnconfigure(0, weight=1)
+            card.grid_columnconfigure(1, weight=0)
 
             query = entry.get("query", "")
             pos = entry.get("position", 0)
@@ -544,46 +559,48 @@ class PiPhoneApp(ctk.CTk):
             elapsed = entry.get("elapsed_seconds", 0.0)
             ts = entry.get("timestamp", "")
 
-            # Title: Query & Position
+            # Title: Query & Position (Line 1: 14pt bold, stretched)
             title_text = f"{query}  →  Digit #{pos:,}"
             lbl_title = ReadonlySelectableEntry(
                 card,
                 text=title_text,
-                font=("Segoe UI", 12, "bold"),
+                font=("Segoe UI", 14, "bold"),
                 fg="#E0E0E0",
                 bg="#232323",
                 justify="left",
             )
-            lbl_title.grid(row=0, column=0, sticky="w", padx=10, pady=(6, 0))
+            lbl_title.grid(row=0, column=0, sticky="ew", padx=(12, 8), pady=(6, 0))
 
-            # Context snippet: pre [tgt] flw
+            # Context snippet: pre [tgt] flw (Line 2: 13pt, stretched)
             context_text = f"Context: {pre} [{tgt}] {flw}"
             lbl_context = ReadonlySelectableEntry(
                 card,
                 text=context_text,
-                font=("Segoe UI", 11),
+                font=("Segoe UI", 13),
                 fg="#4CAF50",
                 bg="#232323",
                 justify="left",
             )
-            lbl_context.grid(row=1, column=0, sticky="w", padx=10, pady=(0, 2))
+            lbl_context.grid(row=1, column=0, sticky="ew", padx=(12, 8), pady=(0, 2))
 
-            # Sub-info: Source, time, timestamp
+            # Sub-info: Source, time, timestamp (Line 3: 11pt, stretched)
             sub_info = f"{source} ({elapsed*1000:.1f}ms)  •  {ts}"
-            lbl_sub = ctk.CTkLabel(
+            lbl_sub = ReadonlySelectableEntry(
                 card,
                 text=sub_info,
-                text_color="gray60",
-                font=ctk.CTkFont(size=11),
+                font=("Segoe UI", 11),
+                fg="gray60",
+                bg="#232323",
+                justify="left",
             )
-            lbl_sub.grid(row=2, column=0, sticky="w", padx=10, pady=(0, 6))
+            lbl_sub.grid(row=2, column=0, sticky="ew", padx=(12, 8), pady=(0, 6))
 
             # View button to reload this result into the Dialer tab
             btn_view = ctk.CTkButton(
                 card,
                 text="View",
-                width=55,
-                height=26,
+                width=56,
+                height=28,
                 fg_color="#37474F",
                 hover_color="#455A64",
                 font=ctk.CTkFont(size=11, weight="bold"),
@@ -591,7 +608,7 @@ class PiPhoneApp(ctk.CTk):
                     q, p, pr, t, f, s, e
                 ),
             )
-            btn_view.grid(row=0, column=1, rowspan=3, padx=10, pady=6, sticky="e")
+            btn_view.grid(row=0, column=1, rowspan=3, padx=(4, 12), pady=6, sticky="e")
 
     def _load_history_result(
         self,
