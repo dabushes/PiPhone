@@ -1,24 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
-import os
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [('seed', 'seed')]
 binaries = []
 hiddenimports = ['_pylong']
 tmp_ret = collect_all('customtkinter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('gmpy2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-try:
-    tmp_ret = collect_all('zstandard')
-    datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-except Exception:
-    pass
 
-if os.path.exists('seed/pi_100m.zst'):
-    datas += [('seed/pi_100m.zst', 'seed')]
-elif os.path.exists('seed/pi_100m.gz'):
-    datas += [('seed/pi_100m.gz', 'seed')]
 
 a = Analysis(
     ['piphone.py'],
