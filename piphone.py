@@ -301,8 +301,8 @@ class PiPhoneApp(ctk.CTk):
 
         # Window configuration
         self.title("PiPhone")
-        self.geometry("460x700")
-        self.minsize(440, 620)
+        self.geometry("500x700")
+        self.minsize(480, 620)
 
         # Core engine & concurrency
         self.engine = PiEngine(data_dir="data", default_seed_digits=100_000_000, load_seed_pack=True)
@@ -583,8 +583,12 @@ class PiPhoneApp(ctk.CTk):
             )
             lbl_context.grid(row=1, column=0, sticky="ew", padx=(12, 8), pady=(0, 2))
 
-            # Sub-info: Source, time, timestamp (Line 3: 11pt, stretched)
-            sub_info = f"{source} ({elapsed*1000:.1f}ms)  •  {ts}"
+            # Sub-info: Source, time, timestamp (Line 3: 11pt, spans both columns)
+            if elapsed >= 1.0:
+                time_str = f"{elapsed:.2f}s"
+            else:
+                time_str = f"{elapsed*1000:.1f}ms"
+            sub_info = f"{source} ({time_str}) • {ts}"
             lbl_sub = ReadonlySelectableEntry(
                 card,
                 text=sub_info,
@@ -593,9 +597,9 @@ class PiPhoneApp(ctk.CTk):
                 bg="#232323",
                 justify="left",
             )
-            lbl_sub.grid(row=2, column=0, sticky="ew", padx=(12, 8), pady=(0, 6))
+            lbl_sub.grid(row=2, column=0, columnspan=2, sticky="ew", padx=(12, 12), pady=(0, 6))
 
-            # View button to reload this result into the Dialer tab
+            # View button to reload this result into the Dialer tab (sits in rows 0 & 1)
             btn_view = ctk.CTkButton(
                 card,
                 text="View",
@@ -608,7 +612,7 @@ class PiPhoneApp(ctk.CTk):
                     q, p, pr, t, f, s, e
                 ),
             )
-            btn_view.grid(row=0, column=1, rowspan=3, padx=(4, 12), pady=6, sticky="e")
+            btn_view.grid(row=0, column=1, rowspan=2, padx=(4, 12), pady=(6, 2), sticky="e")
 
     def _load_history_result(
         self,
