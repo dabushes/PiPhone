@@ -1643,6 +1643,28 @@ class PiEngine:
                     gc.collect()
             self._sync_seed_in_background()
 
+    def expand_seed(
+        self,
+        target_len: int,
+        progress_callback: Optional[Callable[[str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> int:
+        """
+        Public method to dynamically expand the persistent seed cache to target_len digits.
+        Executes cancellable calculation, appends delta to disk, updates indices, and syncs seed.
+        Returns the new total cached digit count.
+        """
+        old_total = len(self.digits)
+        if target_len <= old_total:
+            return old_total
+
+        if progress_callback:
+            progress_callback(f"Expanding Pi cache from {old_total:,} to {target_len:,} digits...")
+
+        self._expand_to_length(target_len, cancel_event=cancel_event)
+        gc.collect()
+        return len(self.digits)
+
     def log_history(self, result: SearchResult) -> None:
         """Appends a search result to the search history JSON log."""
         history = []

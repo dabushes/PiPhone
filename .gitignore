@@ -10,3 +10,4 @@ data/
 *.piidx
 *.tmp
 *.ckpt.*
+build_personal_index.py

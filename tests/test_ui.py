@@ -85,3 +85,12 @@ def test_key_press_ctrl_bypass():
     mock_app._append_digit.assert_not_called()
     mock_app._clear_input.assert_not_called()
 
+
+def test_aria_announcement_label(root_tk):
+    """Verifies AriaAnnouncementLabel updates text with screen reader announcement."""
+    from piphone import AriaAnnouncementLabel
+    label = AriaAnnouncementLabel(root_tk)
+    label.announce("Search completed: sequence 12345 found at position 500.")
+    assert "Search completed" in label.cget("text")
+    assert "12345" in label.cget("text")
+

@@ -8,6 +8,11 @@
 
 | Feature | Description |
 |---------|-------------|
+| **Dynamic Seed Expansion** | Dropdown selector (`100M`, `500M`, `1B` digits) with confirmation prompts, memory/time estimates, and background async expansion for deep offline caches. |
+| **Safe-RAM Index Miss Guard** | Catches index and seed misses gracefully without blocking or unbounded live calculation, prompting the user with non-blocking expansion and live calculation options. |
+| **Screen Reader & a11y Live Regions** | Full accessibility support with `AriaAnnouncementLabel` emitting live-region updates to Windows Narrator & NVDA, plus keyboard navigation (`Ctrl+F`, `Return`, `Tab`). |
+| **About & Architecture Screen** | Interactive dialog (`ⓘ About`) explaining Ramanujan-Chudnovsky math, Coupon Collector's theorem ($E[T] \approx 236.4\text{B}$ digits), memory-mapped `.piidx` architecture, and hardware benchmarks. |
+| **Security & Memory Safety** | Formal security policy ([`SECURITY.md`](SECURITY.md)) auditing local file I/O sandboxing, uint40 LE buffer bounds, and process-isolated subprocess IPC. |
 | **Modular Engine Selector** | Segmented button on the Dialer tab allowing instantaneous toggling between `Standard Live` calculation and `Binary Index (.piidx)`. |
 | **10-Digit Binary Index Engine** | Microsecond ($< 1\text{ms}$) lookups via memory-mapped `.piidx` files with dual-mode support (Mode 1: sorted 10-byte stragglers; Mode 2: $O(1)$ direct 5-byte array). |
 | **Side-by-Side Comparison Mode** | `Compare Both` checkbox running both search engines back-to-back, displaying relative latencies and the speedup factor ($\text{X.X}\times$ faster ⚡). |

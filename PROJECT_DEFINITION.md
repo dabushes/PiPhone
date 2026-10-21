@@ -276,6 +276,20 @@ Offset  Size  Type       Field Name              Description
 * **Atomic Checkpointing**: Supports pause/resume via `save_checkpoint()` and `load_checkpoint()`, persisting `bitset.ckpt.bin` and `state.ckpt.json`.
 * **GUI Index Manager**: Dedicated management modal (`IndexManagerDialog`) to inspect index metadata, load/unload `.piidx` files, or build new indices with real-time throughput metrics.
 
+### 3.6 Dynamic Seed Expansion & Dropdown Selector
+* **Polite Cache Miss Banner**: When a 10-digit number misses in the currently loaded seed/cache, displays `[Digit not found in current seed cache.]` along with an expansion panel.
+* **Dropdown Selection**: Supports expanding seed to `100M Digits`, `500M Digits`, or `1B Digits`.
+* **Resource Warning Modal**: Displays confirmation prompt with RAM and time estimates (~150MB/30-60s for 100M, ~600MB/1-3min for 500M, ~1.2GB/4-8min for 1B) before allocating memory.
+* **Background Daemon Threading**: Performs expansion asynchronously with a real-time progress bar, polling telemetry, and automatic bitset/string memory reclamation via `gc.collect()`.
+
+### 3.7 Accessibility & Screen Reader Live Regions
+* **Aria Live Region Component**: `AriaAnnouncementLabel` emits dynamic `<<LiveRegionChanged>>` notifications for Windows Narrator and NVDA screen readers on search completion, engine switches, and seed expansion.
+* **Keyboard Navigation**: Logical tab order traversal, focus ring indicators, and global shortcuts (`Ctrl+F` or `Return`) to instantly focus the search input from any view.
+
+### 3.8 Security Posture & Architecture Review
+* **Formal Security Policy**: Documented in [`SECURITY.md`](SECURITY.md) covering local file sandboxing, path traversal prevention, uint40 bounds ($2^{40} - 1 \approx 1.09\text{T}$ digits), read-only mmap memory paging, and process-isolated subprocess termination.
+* **Interactive About Dialog**: Provides in-app educational documentation covering Chudnovsky series math, Coupon Collector's probability theorem ($E[T] \approx 236.4\text{B}$ digits for 10-digit coverage), and dual-mode `.piidx` architecture.
+
 ---
 
 ## 4. Concurrency & Thread-Safety Model
