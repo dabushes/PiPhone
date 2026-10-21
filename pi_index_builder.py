@@ -329,11 +329,30 @@ class BinaryIndexBuilder:
             "unsorted_bytes": unsorted_bytes,
         }
 
-        with open(c_dir / "state.ckpt.json", "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
+        # Stage writing to temporary files before atomic swap to guarantee crash safety
+        tmp_bitset = c_dir / "bitset.ckpt.bin.tmp"
+        tmp_state = c_dir / "state.ckpt.json.tmp"
 
-        with open(c_dir / "bitset.ckpt.bin", "wb") as f:
-            f.write(self.bitset)
+        try:
+            with open(tmp_bitset, "wb") as f:
+                f.write(self.bitset)
+
+            with open(tmp_state, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+
+            os.replace(tmp_bitset, c_dir / "bitset.ckpt.bin")
+            os.replace(tmp_state, c_dir / "state.ckpt.json")
+        finally:
+            if tmp_bitset.exists():
+                try:
+                    tmp_bitset.unlink()
+                except Exception:
+                    pass
+            if tmp_state.exists():
+                try:
+                    tmp_state.unlink()
+                except Exception:
+                    pass
 
     def load_checkpoint(self, ckpt_dir: Path | str) -> None:
         """Resumes builder state from a saved checkpoint."""
@@ -344,8 +363,16 @@ class BinaryIndexBuilder:
         if not state_file.exists() or not bitset_file.exists():
             raise FileNotFoundError(f"Checkpoint files missing in {c_dir}")
 
-        with open(state_file, "r", encoding="utf-8") as f:
-            state = json.load(f)
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        except Exception as e:
+            raise ValueError(f"Corrupted checkpoint state file: {e}") from e
+
+        required_keys = ("mode", "cutoff_pos", "max_pi_digit_scanned", "window", "tail_9", "unique_count")
+        for k in required_keys:
+            if k not in state:
+                raise ValueError(f"Corrupted checkpoint state file: missing key '{k}'")
 
         self.mode = BinaryIndexMode(state["mode"])
         self.cutoff_pos = state["cutoff_pos"]
@@ -353,6 +380,12 @@ class BinaryIndexBuilder:
         self.window = state["window"]
         self.tail_9 = state["tail_9"]
         self.unique_count = state["unique_count"]
+
+        bitset_stat = bitset_file.stat().st_size
+        if bitset_stat != self.bitset_size:
+            raise ValueError(
+                f"Corrupted or truncated bitset checkpoint: size is {bitset_stat} bytes, expected {self.bitset_size} bytes"
+            )
 
         with open(bitset_file, "rb") as f:
             self.bitset = bytearray(f.read())

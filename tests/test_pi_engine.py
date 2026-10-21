@@ -119,6 +119,14 @@ def test_tc04_input_validation_and_11th_digit_block():
     with pytest.raises(ValueError, match="digits only"):
         validate_query("3.1415")
 
+    # Strict ASCII: Unicode numerals (Arabic-Indic, superscript, fullwidth) rejected
+    with pytest.raises(ValueError, match="digits only"):
+        validate_query("١٢٣٤")
+    with pytest.raises(ValueError, match="digits only"):
+        validate_query("123²")
+    with pytest.raises(ValueError, match="digits only"):
+        validate_query("１２３")
+
     # 11th digit block (length > 10)
     with pytest.raises(ValueError, match=f"maximum length of {MAX_QUERY_LENGTH}"):
         validate_query("12345678901")  # 11 digits
@@ -1344,5 +1352,222 @@ def test_tc33_safe_ram_index_miss_guard(tmp_path: Path):
     engine.unload_binary_index()
     assert engine.binary_index is None
     gc.collect()
+
+
+# =====================================================================
+# TC-34: Malformed Seed Import & Atomic Staging Non-Destruction
+# =====================================================================
+def test_tc34_malformed_seed_import_and_atomic_staging(tmp_path: Path):
+    """
+    TC-34: Verify seed import validation & atomic staging:
+    - Rejects invalid 10-digit prefix ('does not start with standard Pi digits').
+    - Rejects Unicode numerals (Arabic-Indic, superscript) even with valid prefix.
+    - Rejects non-numeric ASCII characters.
+    - Rejects corrupted/truncated compressed archives.
+    - Non-destructive guarantee: When import fails, active cache (digits and file)
+      remains strictly untouched without partial overwrites.
+    - Successful import atomically updates cache via os.replace() without leftover .tmp.
+    """
+    dest_data = tmp_path / "engine_data"
+    engine = PiEngine(data_dir=dest_data, default_seed_digits=2000, load_seed_pack=False)
+    original_digits = engine.digits
+    assert len(original_digits) == 2000
+    assert engine.digits_file.read_text(encoding="ascii") == original_digits
+
+    # 1. Invalid prefix
+    bad_prefix = tmp_path / "bad_prefix.txt"
+    bad_prefix.write_text("3141592653" + "0" * 100, encoding="utf-8")
+    with pytest.raises(ValueError, match="does not start with standard Pi digits"):
+        engine.import_seed(bad_prefix)
+    assert engine.digits == original_digits
+    assert engine.digits_file.read_text(encoding="ascii") == original_digits
+
+    # 2. Valid prefix but non-ASCII Unicode numerals (e.g. Arabic-Indic digits \u0660)
+    unicode_seed = tmp_path / "unicode_numerals.txt"
+    unicode_seed.write_text("1415926535" + "\u0660\u0661\u0662\u0663" * 20, encoding="utf-8")
+    with pytest.raises(ValueError, match="contains non-numeric or non-ASCII characters"):
+        engine.import_seed(unicode_seed)
+    assert engine.digits == original_digits
+    assert engine.digits_file.read_text(encoding="ascii") == original_digits
+
+    # 3. Valid prefix but superscript digits (\u00b2\u00b3)
+    superscript_seed = tmp_path / "superscript.txt"
+    superscript_seed.write_text("1415926535\u00b2\u00b39999", encoding="utf-8")
+    with pytest.raises(ValueError, match="contains non-numeric or non-ASCII characters"):
+        engine.import_seed(superscript_seed)
+    assert engine.digits == original_digits
+    assert engine.digits_file.read_text(encoding="ascii") == original_digits
+
+    # 4. Valid prefix but letters/symbols
+    bad_symbols = tmp_path / "bad_symbols.txt"
+    bad_symbols.write_text("1415926535abcdef8979", encoding="utf-8")
+    with pytest.raises(ValueError, match="contains non-numeric or non-ASCII characters"):
+        engine.import_seed(bad_symbols)
+    assert engine.digits == original_digits
+    assert engine.digits_file.read_text(encoding="ascii") == original_digits
+
+    # 5. Corrupted compressed seed archive (.zst with invalid bytes)
+    corrupted_zst = tmp_path / "corrupt.zst"
+    corrupted_zst.write_bytes(b"\x28\xb5\x2f\xfd" + b"\x00\xff" * 50)  # bad zstd frame
+    with pytest.raises(ValueError, match="Malformed or corrupted compressed seed"):
+        engine.import_seed(corrupted_zst)
+    assert engine.digits == original_digits
+    assert engine.digits_file.read_text(encoding="ascii") == original_digits
+
+    # 6. Non-existent file
+    with pytest.raises(FileNotFoundError):
+        engine.import_seed(tmp_path / "non_existent.txt")
+
+    # 7. Successful import: Verify atomic staging and no leftover .tmp files
+    valid_seed = tmp_path / "valid_seed.txt"
+    valid_digits = "1415926535897932384626433832795028841971"
+    valid_seed.write_text(valid_digits, encoding="utf-8")
+    count = engine.import_seed(valid_seed)
+    assert count == len(valid_digits)
+    assert engine.digits == valid_digits
+    assert engine.digits_file.read_text(encoding="ascii") == valid_digits
+    # No temporary files lingering in data directory
+    tmp_files = list(dest_data.glob("*.tmp"))
+    assert len(tmp_files) == 0
+
+
+# =====================================================================
+# TC-35: Corrupted and Truncated .piidx Binary Index Validation
+# =====================================================================
+def test_tc35_corrupted_truncated_piidx_validation(tmp_path: Path):
+    """
+    TC-35: Verify binary index (.piidx) failure modes:
+    - Files < 16 bytes rejected.
+    - Files with invalid magic bytes rejected.
+    - Files with invalid mode byte rejected.
+    - Mode 1 files with truncated record payloads (payload % 10 != 0) rejected.
+    - Mode 2 files with truncated direct array rejected.
+    - File handles safely released upon exception (no resource leak).
+    - Phone lookup gracefully returns None for non-ASCII Unicode numerals.
+    - PiEngine.load_binary_index safely handles corruption without corrupting state.
+    """
+    # 1. Truncated header (< 16 bytes)
+    short_file = tmp_path / "short.piidx"
+    short_file.write_bytes(b"PI10\x01\x01\x00")  # 7 bytes
+    with pytest.raises(ValueError, match="Corrupt index file: size.*< header size"):
+        PiBinaryIndex(short_file)
+
+    # 2. Bad magic bytes (16 bytes but invalid signature)
+    bad_magic = tmp_path / "bad_magic.piidx"
+    bad_magic.write_bytes(b"WRONG\x01" + b"\x00" * 10)
+    with pytest.raises(ValueError, match="Invalid index magic bytes"):
+        PiBinaryIndex(bad_magic)
+
+    # 3. Invalid mode byte (e.g. mode 99)
+    bad_mode = tmp_path / "bad_mode.piidx"
+    raw_bad_mode = bytearray(b"PI10\x01") + bytearray([99]) + bytearray(b"\x00" * 10)
+    bad_mode.write_bytes(bytes(raw_bad_mode))
+    with pytest.raises(ValueError, match="Unsupported binary index mode"):
+        PiBinaryIndex(bad_mode)
+
+    # 4. Mode 1 with truncated record payload (16 bytes header + 7 bytes payload)
+    trunc_payload = tmp_path / "trunc_payload.piidx"
+    hdr_m1 = encode_header(BinaryIndexMode.STRAGGLER_SORTED_10B, 0, 1000)
+    trunc_payload.write_bytes(hdr_m1 + b"\x01\x02\x03\x04\x05\x06\x07")
+    with pytest.raises(ValueError, match="payload size .* is not a multiple of record size"):
+        PiBinaryIndex(trunc_payload)
+
+    # 5. Mode 2 with truncated direct array (16 bytes header + 3 bytes payload, not multiple of 5)
+    trunc_direct = tmp_path / "trunc_direct.piidx"
+    hdr_m2 = encode_header(BinaryIndexMode.FULL_DIRECT_5B, 0, 1000)
+    trunc_direct.write_bytes(hdr_m2 + b"\x01\x02\x03")
+    with pytest.raises(ValueError, match="payload size .* is not a multiple of record size"):
+        PiBinaryIndex(trunc_direct)
+
+    # 6. Lookup with Unicode numerals returns None
+    valid_idx = tmp_path / "valid.piidx"
+    valid_idx.write_bytes(encode_header(BinaryIndexMode.STRAGGLER_SORTED_10B, 0, 1000))
+    idx = PiBinaryIndex(valid_idx)
+    assert idx.lookup("1234567890") is None
+    assert idx.lookup("١٢٣٤٥٦٧٨٩٠") is None  # Arabic-Indic digits
+    assert idx.lookup("123456789²") is None  # Superscript digit
+    assert idx.lookup("12345") is None  # Wrong length
+    idx.close()
+
+    # 7. Engine load_binary_index safely raises on corrupt file and does not replace state
+    engine = PiEngine(data_dir=tmp_path / "eng_data", default_seed_digits=1000, load_seed_pack=False)
+    with pytest.raises(ValueError):
+        engine.load_binary_index(bad_magic)
+    assert engine.binary_index is None
+    assert engine.binary_index_path is None
+
+
+# =====================================================================
+# TC-36: Checkpoint Corruption and Interrupted Bitset Writes
+# =====================================================================
+def test_tc36_checkpoint_corruption_and_interrupted_write(tmp_path: Path):
+    """
+    TC-36: Verify BinaryIndexBuilder checkpoint integrity:
+    - Missing checkpoint files raise FileNotFoundError.
+    - Corrupted / invalid JSON in state.ckpt.json raises ValueError.
+    - Missing required keys in state.ckpt.json raises ValueError.
+    - Truncated bitset.ckpt.bin raises ValueError.
+    - Interrupted / failed checkpoint write preserves prior intact checkpoint.
+    """
+    ckpt_dir = tmp_path / "ckpt"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Missing files
+    builder = BinaryIndexBuilder(
+        mode=BinaryIndexMode.STRAGGLER_SORTED_10B,
+        cutoff_pos=0,
+        bitset_bytes=1024,
+    )
+    with pytest.raises(FileNotFoundError, match="Checkpoint files missing"):
+        builder.load_checkpoint(ckpt_dir)
+
+    # 2. Corrupted JSON state file
+    (ckpt_dir / "state.ckpt.json").write_text("{invalid_json: 123,", encoding="utf-8")
+    (ckpt_dir / "bitset.ckpt.bin").write_bytes(b"\x00" * 1024)
+    with pytest.raises(ValueError, match="Corrupted checkpoint state file"):
+        builder.load_checkpoint(ckpt_dir)
+
+    # 3. Missing required key in state file
+    (ckpt_dir / "state.ckpt.json").write_text('{"mode": 1, "cutoff_pos": 0}', encoding="utf-8")
+    with pytest.raises(ValueError, match="missing key"):
+        builder.load_checkpoint(ckpt_dir)
+
+    # 4. Truncated bitset file (expected 1024 bytes, but only 500 bytes present)
+    valid_state = {
+        "mode": 1,
+        "cutoff_pos": 0,
+        "max_pi_digit_scanned": 5000,
+        "window": 1234567890,
+        "tail_9": "123456789",
+        "unique_count": 42,
+        "unsorted_bytes": 0,
+    }
+    import json
+    (ckpt_dir / "state.ckpt.json").write_text(json.dumps(valid_state), encoding="utf-8")
+    (ckpt_dir / "bitset.ckpt.bin").write_bytes(b"\x00" * 500)
+    with pytest.raises(ValueError, match="Corrupted or truncated bitset checkpoint"):
+        builder.load_checkpoint(ckpt_dir)
+
+    # 5. Interrupted bitset checkpoint writes:
+    # Save a valid checkpoint first
+    builder.current_pos = 5000
+    builder.unique_count = 42
+    builder.bitset[10] = 0xFF
+    builder.save_checkpoint(ckpt_dir)
+
+    # Simulate an interrupted subsequent write that left a partial .tmp file
+    tmp_bitset = ckpt_dir / "bitset.ckpt.bin.tmp"
+    tmp_bitset.write_bytes(b"\xAA" * 200)
+
+    # Verify existing active checkpoint remains intact and can be loaded
+    fresh_builder = BinaryIndexBuilder(
+        mode=BinaryIndexMode.STRAGGLER_SORTED_10B,
+        cutoff_pos=0,
+        bitset_bytes=1024,
+    )
+    fresh_builder.load_checkpoint(ckpt_dir)
+    assert fresh_builder.current_pos == 5000
+    assert fresh_builder.unique_count == 42
+    assert fresh_builder.bitset[10] == 0xFF
 
 

@@ -67,10 +67,13 @@ python piphone.py
 
 ### Building an Executable
 
-To package the application into a standalone desktop executable with bundled assets and external visible seed:
+To package the application into a standalone desktop executable with all bundled assets, native C extensions, and external visible seed:
 
 ```sh
-pyinstaller --noconsole --onefile --name "PiPhone" --add-data "seed;seed" piphone.py
+# Canonical build command using the hardened PyInstaller spec configuration
+# (Ensures all hidden imports such as zstandard, gmpy2, and customtkinter assets are bundled)
+pyinstaller PiPhone.spec
+
 # Copy seed directory to dist/ for external distribution
 python -c "import shutil, pathlib; (pathlib.Path('dist/seed')).mkdir(parents=True, exist_ok=True); shutil.copy2('seed/pi_100m.zst', 'dist/seed/pi_100m.zst')"
 ```

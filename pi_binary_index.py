@@ -113,20 +113,39 @@ class PiBinaryIndex:
         self.file = open(self.path, "rb")
         try:
             self.mmap = mmap.mmap(self.file.fileno(), 0, access=mmap.ACCESS_READ)
+            mode, cutoff, max_scanned = decode_header(self.mmap[0:HEADER_SIZE])
+            self.mode = mode
+            self.cutoff_pos = cutoff
+            self.max_pi_digit_scanned = max_scanned
+
+            if self.mode == BinaryIndexMode.STRAGGLER_SORTED_10B:
+                payload_len = self.file_size - HEADER_SIZE
+                if payload_len % RECORD_SIZE_STRAGGLER != 0:
+                    raise ValueError(
+                        f"Corrupt index file: payload size ({payload_len} bytes) is not a multiple of record size ({RECORD_SIZE_STRAGGLER} bytes)"
+                    )
+                self.record_count = payload_len // RECORD_SIZE_STRAGGLER
+            else:
+                payload_len = self.file_size - HEADER_SIZE
+                if payload_len % RECORD_SIZE_DIRECT != 0:
+                    raise ValueError(
+                        f"Corrupt direct index file: payload size ({payload_len} bytes) is not a multiple of record size ({RECORD_SIZE_DIRECT} bytes)"
+                    )
+                self.record_count = 10_000_000_000
         except Exception:
-            self.file.close()
-            self.file = None
+            if self.mmap is not None:
+                try:
+                    self.mmap.close()
+                except Exception:
+                    pass
+                self.mmap = None
+            if self.file is not None:
+                try:
+                    self.file.close()
+                except Exception:
+                    pass
+                self.file = None
             raise
-
-        mode, cutoff, max_scanned = decode_header(self.mmap[0:HEADER_SIZE])
-        self.mode = mode
-        self.cutoff_pos = cutoff
-        self.max_pi_digit_scanned = max_scanned
-
-        if self.mode == BinaryIndexMode.STRAGGLER_SORTED_10B:
-            self.record_count = (self.file_size - HEADER_SIZE) // RECORD_SIZE_STRAGGLER
-        else:
-            self.record_count = 10_000_000_000
 
     def lookup(self, phone_str: str) -> Optional[int]:
         """
@@ -136,7 +155,7 @@ class PiBinaryIndex:
         if self.mmap is None:
             return None
         
-        if len(phone_str) != 10 or not phone_str.isdigit():
+        if len(phone_str) != 10 or not (phone_str.isascii() and phone_str.isdigit()):
             return None
 
         target_int = int(phone_str)

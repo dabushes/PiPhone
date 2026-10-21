@@ -188,7 +188,7 @@ def validate_query(query: str) -> str:
         raise ValueError("Query cannot be empty.")
     if len(cleaned) > MAX_QUERY_LENGTH:
         raise ValueError(f"Query exceeds maximum length of {MAX_QUERY_LENGTH} digits.")
-    if not cleaned.isdigit():
+    if not (cleaned.isascii() and cleaned.isdigit()):
         raise ValueError("Query must contain digits only (0-9).")
     return cleaned
 
@@ -589,9 +589,10 @@ class PiEngine:
         Validates that:
         1. File exists.
         2. Stream starts with standard Pi sequence '1415926535' (first 10 decimal digits).
-        3. Stream contains numeric digits only.
-        Writes stream to self.digits_file, updates self.digits, resets query cache,
-        persists state, and syncs external seed archive if running frozen.
+        3. Stream contains strict ASCII decimal digits only ('0' through '9').
+        Stages verified stream by writing to a temporary .tmp file before atomically swapping
+        into self.digits_file via os.replace(), ensuring active cache is never corrupted in-place.
+        Updates self.digits, resets query cache, persists state, and syncs external seed archive if running frozen.
         Returns the total digit count imported.
         """
         src = Path(src_path).resolve()
@@ -603,10 +604,16 @@ class PiEngine:
 
         name_lower = src.name.lower()
         if name_lower.endswith((".zst", ".xz", ".gz")):
-            imported_digits = decompress_seed_file(src)
+            try:
+                imported_digits = decompress_seed_file(src)
+            except Exception as e:
+                raise ValueError(f"Malformed or corrupted compressed seed: {e}") from e
         else:
-            with open(src, "r", encoding="ascii") as f:
-                imported_digits = f.read().strip()
+            try:
+                with open(src, "r", encoding="utf-8") as f:
+                    imported_digits = f.read().strip()
+            except UnicodeDecodeError as e:
+                raise ValueError(f"Invalid seed file: contains non-ASCII characters ({e})") from e
 
         if progress_callback:
             progress_callback("Validating Pi sequence...")
@@ -614,24 +621,34 @@ class PiEngine:
         if not imported_digits.startswith("1415926535"):
             raise ValueError("Invalid seed file: does not start with standard Pi digits ('1415926535').")
 
-        if not imported_digits.isdigit():
-            raise ValueError("Invalid seed file: contains non-numeric characters.")
+        if not (imported_digits.isascii() and imported_digits.isdigit()):
+            raise ValueError("Invalid seed file: contains non-numeric or non-ASCII characters.")
 
         digit_count = len(imported_digits)
 
         if progress_callback:
             progress_callback("Saving imported digits...")
 
-        with self._lock:
-            self.digits = imported_digits
-            with open(self.digits_file, "w", encoding="ascii") as f:
-                f.write(self.digits)
+        import uuid
+        temp_file = self.digits_file.parent / f"{self.digits_file.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(temp_file, "w", encoding="ascii") as f:
+                f.write(imported_digits)
 
-            self.query_cache.clear()
-            self.prefix_index.clear()
-            self._sort_indices()
-            self._save_index()
-            gc.collect()
+            with self._lock:
+                os.replace(temp_file, self.digits_file)
+                self.digits = imported_digits
+                self.query_cache.clear()
+                self.prefix_index.clear()
+                self._sort_indices()
+                self._save_index()
+                gc.collect()
+        finally:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
 
         self._sync_seed_in_background()
         return digit_count

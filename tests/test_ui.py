@@ -94,3 +94,26 @@ def test_aria_announcement_label(root_tk):
     assert "Search completed" in label.cget("text")
     assert "12345" in label.cget("text")
 
+
+def test_dialer_input_validation_strict_ascii():
+    """Verifies PiPhoneApp._validate_input_change strictly enforces ASCII decimal digits."""
+    mock_app = MagicMock(spec=PiPhoneApp)
+    mock_app._validate_input_change = PiPhoneApp._validate_input_change.__get__(mock_app, PiPhoneApp)
+
+    # Valid ASCII inputs
+    assert mock_app._validate_input_change("") is True
+    assert mock_app._validate_input_change("1") is True
+    assert mock_app._validate_input_change("1234567890") is True
+
+    # Block > 10 digits
+    assert mock_app._validate_input_change("12345678901") is False
+
+    # Block non-numeric ASCII
+    assert mock_app._validate_input_change("123a") is False
+    assert mock_app._validate_input_change("123-456") is False
+
+    # Block Unicode numerals (Arabic-Indic, superscript, fullwidth)
+    assert mock_app._validate_input_change("١٢٣٤") is False
+    assert mock_app._validate_input_change("123²") is False
+    assert mock_app._validate_input_change("１２３") is False
+

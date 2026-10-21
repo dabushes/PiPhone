@@ -1,7 +1,7 @@
 """
 PiPhone - Interactive Dark-Mode Pi Dialer & Decimal Expansion Search Engine
-Version 2.3: Seed Export/Import, Calibrated 100M Time Estimates, Instant Progress Bar,
-and Unclipped Status Text.
+Version 2.4: Seed Import Staging, Strict ASCII-Digit Validation, PyInstaller Spec Alignment,
+and Failure-Mode Test Suite.
 """
 
 from __future__ import annotations
@@ -1621,7 +1621,7 @@ class PiPhoneApp(ctk.CTk):
         """Enforces that input only contains digits and never exceeds 10 digits."""
         if new_val == "":
             return True
-        if not new_val.isdigit():
+        if not (new_val.isascii() and new_val.isdigit()):
             return False
         if len(new_val) > 10:
             return False
@@ -1632,7 +1632,7 @@ class PiPhoneApp(ctk.CTk):
         if self._is_searching:
             return
         val = self.number_entry.get().strip()
-        if 1 <= len(val) <= 10 and val.isdigit():
+        if 1 <= len(val) <= 10 and (val.isascii() and val.isdigit()):
             self.btn_action.configure(state="normal")
         else:
             self.btn_action.configure(state="disabled")
@@ -1642,7 +1642,7 @@ class PiPhoneApp(ctk.CTk):
         if self._is_searching:
             return
         current = self.number_entry.get()
-        if len(current) < 10 and char.isdigit():
+        if len(current) < 10 and len(char) == 1 and ("0" <= char <= "9"):
             self.number_entry.insert("end", char)
             self._update_action_button_state()
 
@@ -1722,7 +1722,7 @@ class PiPhoneApp(ctk.CTk):
         digit = None
         if keysym in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9"):
             digit = keysym
-        elif keysym.startswith("KP_") and len(keysym) == 4 and keysym[3].isdigit():
+        elif keysym.startswith("KP_") and len(keysym) == 4 and ("0" <= keysym[3] <= "9"):
             digit = keysym[3]
 
         if digit is not None:
@@ -1746,7 +1746,7 @@ class PiPhoneApp(ctk.CTk):
     def _start_search(self):
         """Launches the background search worker thread."""
         query = self.number_entry.get().strip()
-        if not (1 <= len(query) <= 10 and query.isdigit()):
+        if not (1 <= len(query) <= 10 and query.isascii() and query.isdigit()):
             return
 
         self._is_searching = True
