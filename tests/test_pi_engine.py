@@ -3,9 +3,12 @@ Test suite for PiEngine (PiPhone backend).
 Covers TC-01 through TC-11 (plus Chudnovsky precision and cold start persistence).
 """
 
+from __future__ import annotations
+
 import threading
 import time
 from pathlib import Path
+from typing import Any, Callable, Optional, Tuple
 
 import pytest
 from pi_binary_index import (
