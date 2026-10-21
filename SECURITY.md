@@ -58,3 +58,4 @@ If you discover a security vulnerability or memory leak in PiPhone, please do NO
    - Minimal reproduction script or input sequence triggering the anomaly.
    - Crash dumps or error stack traces if applicable.
 3. **Response Timeline:** We aim to acknowledge reports within **48 hours** and provide a patch or mitigation within **7 days**.
+
