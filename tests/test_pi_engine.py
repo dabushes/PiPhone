@@ -1574,3 +1574,44 @@ def test_tc36_checkpoint_corruption_and_interrupted_write(tmp_path: Path):
     assert fresh_builder.bitset[10] == 0xFF
 
 
+# =====================================================================
+# TC-37: Corrupted Index and History File Recovery & Atomic Persistence
+# =====================================================================
+def test_tc37_corrupted_index_recovery_and_atomic_persistence(tmp_path: Path):
+    """
+    TC-37: Verify PiEngine gracefully recovers from corrupted index & history files,
+    and guarantees atomic saving via temporary file swaps.
+    """
+    data_dir = tmp_path / "corrupt_data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Corrupt pi_index.json and search_history.json
+    (data_dir / "pi_index.json").write_text("{corrupt json", encoding="utf-8")
+    (data_dir / "search_history.json").write_text("invalid json...", encoding="utf-8")
+
+    # Engine should load gracefully, resetting query_cache to empty
+    engine = PiEngine(data_dir=data_dir, default_seed_digits=1000, load_seed_pack=False)
+    assert engine.query_cache == []
+    assert engine.prefix_index == []
+
+    # Search triggers log_history and _save_index
+    res = engine.search("1415")
+    assert res is not None
+    engine.log_history(res)
+
+    assert (data_dir / "pi_index.json").exists()
+    assert (data_dir / "search_history.json").exists()
+
+    # Verify no lingering .tmp files
+    tmp_files = list(data_dir.glob("*.tmp"))
+    assert len(tmp_files) == 0
+
+    # Verify content is valid JSON
+    import json
+    loaded_idx = json.loads((data_dir / "pi_index.json").read_text(encoding="utf-8"))
+    assert len(loaded_idx["query_cache"]) >= 1
+    loaded_hist = json.loads((data_dir / "search_history.json").read_text(encoding="utf-8"))
+    assert len(loaded_hist) >= 1
+
+
+

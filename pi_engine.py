@@ -760,7 +760,7 @@ class PiEngine:
         self.prefix_index.sort(key=lambda x: x[0])
 
     def _save_index(self) -> None:
-        """Saves sorted query cache and benchmark metrics to disk."""
+        """Saves sorted query cache and benchmark metrics to disk via atomic swap."""
         data = {
             "query_cache": self.query_cache,
             "prefix_index": self.prefix_index,
@@ -769,8 +769,18 @@ class PiEngine:
                 "last_calc_time": self.last_calc_time,
             },
         }
-        with open(self.index_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        import uuid
+        temp_file = self.index_file.parent / f"{self.index_file.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(temp_file, self.index_file)
+        finally:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
 
     @property
     def pi_digits(self) -> str:
@@ -1696,6 +1706,16 @@ class PiEngine:
         record["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
         history.append(record)
         
-        with open(self.history_file, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
+        import uuid
+        temp_file = self.history_file.parent / f"{self.history_file.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+            os.replace(temp_file, self.history_file)
+        finally:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
 
