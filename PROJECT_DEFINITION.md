@@ -260,10 +260,14 @@ Offset  Size  Type       Field Name              Description
   * $O(1)$ direct array indexed by phone integer: lookup at file offset $16 + (\text{phone\_int} \times 5)$.
   * 5 bytes per entry (uint40 LE 1-based position). Returns `None` if value is 0.
 
-#### Automatic Fallback Rules:
+#### Automatic Fallback Rules & Safe-RAM Index Miss Guard:
 * **Case A (1–9 digits)**: Binary Index only indexes 10-digit phone numbers. Queries with 1–9 digits automatically fall back to `STANDARD_ENGINE` with badge `[Fallback: Standard Engine (1-9 digit query)]`.
 * **Case B (10 digits, Hit)**: Returns exact decimal position in microseconds. Context preceding and following digits are empty strings (`""`) for maximum compactness and speed. Source badge indicates `[Engine: 10-Digit Binary Index (Hit in X.XX µs/ms)]`.
-* **Case C (10 digits, Miss or No Index)**: If no index is loaded or the query is not in the indexed range, automatically falls back to `STANDARD_ENGINE` with badge `[Index Miss (Scanned up to Digit #X) -> Fallback: Standard Engine]` or `[No Index Loaded -> Fallback: Standard Engine]`.
+* **Case C (10 digits, Miss or No Index)**:
+  * When `cached_digits >= 100,000,000`, the **Safe-RAM Index Miss Guard** prevents launching an unbounded `mpmath`/`gmpy2` live calculation that would attempt to compute hundreds of millions of digits in a blocking call.
+  * The engine catches the miss gracefully, reports `[Index Miss: Not found in current 340.7M cached digits (3.41% coverage)]` (with coverage calculated as $\frac{\text{cached\_digits}}{10^{10}} \times 100\%$), and the UI displays a non-blocking prompt card with button `[⚡ Run Live Calculation Burst]`.
+  * If clicked, the user can consciously initiate a limited live burst via Standard Engine without UI lockup or out-of-memory spikes.
+  * For smaller caches ($< 100\text{M}$ digits), automatically falls back to `STANDARD_ENGINE` with badge `[Index Miss (Scanned up to Digit #X) -> Fallback: Standard Engine]`.
 
 ### 3.5 Streaming Index Builder (`pi_index_builder.py`)
 * **1.25 GB Bitset Tracking**: Allocates $10^{10}$ bits in a `bytearray(1_250_000_000)` (~17ms on 64-bit systems) to guarantee first-occurrence position tracking in $O(1)$ time.

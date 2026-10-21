@@ -12,6 +12,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -220,6 +221,9 @@ class BinaryIndexBuilder:
                 except Exception:
                     pass
 
+            if "records" in locals():
+                del records
+
         elif self.mode == BinaryIndexMode.FULL_DIRECT_5B:
             if self._direct_file is not None:
                 self._direct_file.seek(0)
@@ -228,6 +232,10 @@ class BinaryIndexBuilder:
                 self._direct_file.flush()
                 self._direct_file.close()
                 self._direct_file = None
+
+        # Clean up in-memory bitset buffer and trigger garbage collection
+        self.bitset = bytearray(0)
+        gc.collect()
 
         return self.output_path
 
@@ -295,6 +303,7 @@ class BinaryIndexBuilder:
                         rf.unlink()
                     except Exception:
                         pass
+            gc.collect()
 
     def save_checkpoint(self, ckpt_dir: Path | str) -> None:
         """Saves bitset and builder state for atomic pause/resume."""

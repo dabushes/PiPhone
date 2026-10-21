@@ -6,6 +6,7 @@ and Unclipped Status Text.
 
 from __future__ import annotations
 
+import gc
 import json
 import queue
 import threading
@@ -380,16 +381,28 @@ class IndexManagerDialog(ctk.CTkToplevel):
             filetypes=[("Pi Binary Index (*.piidx)", "*.piidx"), ("All Files (*.*)", "*.*")],
         )
         if f:
-            try:
-                self.parent.engine.load_binary_index(f)
-                self._refresh_status()
-                messagebox.showinfo("Index Loaded", f"Successfully loaded index:\n{f}", parent=self)
-            except Exception as e:
-                messagebox.showerror("Index Error", f"Failed to load binary index:\n{e}", parent=self)
+            def worker():
+                try:
+                    self.parent.engine.load_binary_index(f)
+                    def on_done():
+                        self._refresh_status()
+                        messagebox.showinfo("Index Loaded", f"Successfully loaded index:\n{f}", parent=self)
+                    self.after(0, on_done)
+                except Exception as e:
+                    err_msg = str(e)
+                    def on_err():
+                        messagebox.showerror("Index Error", f"Failed to load binary index:\n{err_msg}", parent=self)
+                    self.after(0, on_err)
+
+            threading.Thread(target=worker, daemon=True).start()
 
     def _on_unload(self):
-        self.parent.engine.unload_binary_index()
-        self._refresh_status()
+        def worker():
+            self.parent.engine.unload_binary_index()
+            gc.collect()
+            self.after(0, self._refresh_status)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_start_build(self):
         from tkinter import filedialog, messagebox
@@ -496,6 +509,10 @@ class IndexManagerDialog(ctk.CTkToplevel):
                     messagebox.showerror("Build Error", f"Failed to build binary index:\n{err_msg}", parent=self)
 
                 self.after(0, on_err)
+            finally:
+                if "builder" in locals():
+                    del builder
+                gc.collect()
 
         self._build_thread = threading.Thread(target=worker, daemon=True)
         self._build_thread.start()
@@ -966,9 +983,43 @@ class PiPhoneApp(ctk.CTk):
         self.lbl_comp_speed.grid(row=3, column=0, sticky="ew", padx=6, pady=(1, 3))
         self.compare_card.grid_remove()
 
+        # Safe-RAM Index Miss Guard Card (Non-blocking live burst prompt)
+        self.miss_guard_card = ctk.CTkFrame(self.result_frame, fg_color="#211915", corner_radius=6)
+        self.miss_guard_card.grid(row=5, column=0, sticky="ew", padx=6, pady=(2, 5))
+        self.miss_guard_card.grid_columnconfigure(0, weight=1)
+
+        self.lbl_miss_prompt = ReadonlySelectableEntry(
+            self.miss_guard_card,
+            text="Sequence not in index or cached digits. Run a live calculation burst?",
+            font=("Segoe UI", 9),
+            fg="#FFB74D",
+            bg="#211915",
+            justify="center",
+        )
+        self.lbl_miss_prompt.grid(row=0, column=0, sticky="ew", padx=4, pady=(3, 2))
+
+        self.btn_live_burst = ctk.CTkButton(
+            self.miss_guard_card,
+            text="⚡ Run Live Calculation Burst",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            height=26,
+            fg_color="#E65100",
+            hover_color="#BF360C",
+            command=self._on_launch_live_burst,
+        )
+        self.btn_live_burst.grid(row=1, column=0, sticky="ew", padx=16, pady=(1, 4))
+        self.miss_guard_card.grid_remove()
+
     # =========================================================================
     # Engine Selection, Benchmark Comparison & Index Management
     # =========================================================================
+    def _on_launch_live_burst(self):
+        """Switches engine to Standard Live and begins search upon user confirmation."""
+        self.miss_guard_card.grid_remove()
+        self.seg_engine.set("Standard Live")
+        self._engine_mode = SearchEngineMode.STANDARD_ENGINE
+        self._start_search()
+
     def _get_index_status_str(self) -> str:
         """Returns a compact status string describing the currently loaded binary index."""
         if self.engine.binary_index is not None:
@@ -1008,23 +1059,27 @@ class PiPhoneApp(ctk.CTk):
         """Displays side-by-side benchmark comparison metrics in the compare card."""
         self.compare_card.grid()
 
-        if res_std is not None:
+        if res_std is not None and res_std.position > 0:
             std_time = format_latency(res_std.elapsed_seconds)
             self.lbl_comp_std.configure(
                 text=f"Standard: Digit #{res_std.position:,} in {std_time} ({res_std.source})"
             )
+        elif res_std is not None and res_std.position == 0:
+            self.lbl_comp_std.configure(text=f"Standard: {res_std.source}")
         else:
             self.lbl_comp_std.configure(text="Standard: Search stopped / not found")
 
-        if res_bin is not None:
+        if res_bin is not None and res_bin.position > 0:
             bin_time = format_latency(res_bin.elapsed_seconds)
             self.lbl_comp_bin.configure(
                 text=f"Binary Idx: Digit #{res_bin.position:,} in {bin_time} ({res_bin.source})"
             )
+        elif res_bin is not None and res_bin.position == 0:
+            self.lbl_comp_bin.configure(text=f"Binary Idx: {res_bin.source}")
         else:
             self.lbl_comp_bin.configure(text="Binary Idx: Search stopped / not found")
 
-        if speedup > 0:
+        if speedup is not None and speedup > 0:
             self.lbl_comp_speed.configure(
                 text=f"⚡ Speedup: Binary Index is {speedup:,.1f}x faster!"
             )
@@ -1032,7 +1087,14 @@ class PiPhoneApp(ctk.CTk):
             self.lbl_comp_speed.configure(text="⚡ Speedup: Both engines identical or N/A")
 
         # Update primary dialer result display with best result
-        best_res = res_bin or res_std
+        best_res = None
+        if res_bin is not None and res_bin.position > 0:
+            best_res = res_bin
+        elif res_std is not None and res_std.position > 0:
+            best_res = res_std
+        else:
+            best_res = res_bin or res_std
+
         if best_res is not None:
             self._on_search_completed(best_res, is_comparison=True)
 
@@ -1302,6 +1364,7 @@ class PiPhoneApp(ctk.CTk):
         self.number_entry.delete(0, "end")
         self._update_action_button_state()
         self.compare_card.grid_remove()
+        self.miss_guard_card.grid_remove()
         self.lbl_preceding.configure(text="")
         self.lbl_target.configure(text="—")
         self.lbl_following.configure(text="")
@@ -1407,6 +1470,7 @@ class PiPhoneApp(ctk.CTk):
         self.lbl_position.configure(text="Searching decimal expansion of Pi...")
         self.lbl_telemetry.configure(text="Querying index cache...")
         self.compare_card.grid_remove()
+        self.miss_guard_card.grid_remove()
 
         # Start indeterminate progress bar
         self.prog_bar.grid()
@@ -1702,7 +1766,7 @@ class PiPhoneApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_search_completed(self, result: SearchResult, is_comparison: bool = False):
-        """Updates the dialer UI and history tab when a match is found."""
+        """Updates the dialer UI and history tab when a match or miss is processed."""
         self._is_searching = False
         self.prog_bar.stop()
         self.prog_bar.grid_remove()
@@ -1713,6 +1777,25 @@ class PiPhoneApp(ctk.CTk):
         )
         self._update_action_button_state()
 
+        if result.position == 0:
+            self.lbl_status.configure(text="● Not Found", text_color="#FF9800")
+            self.lbl_preceding.configure(text="")
+            self.lbl_target.configure(text=result.target)
+            self.lbl_following.configure(text="")
+            self.lbl_position.configure(text=f"Sequence {result.target} not in cached digits")
+            self.lbl_telemetry.configure(text=result.source)
+            self.lbl_miss_prompt.configure(
+                text="Not found in index/cached seed. Run a live calculation burst?"
+            )
+            self.miss_guard_card.grid()
+
+            if not is_comparison:
+                self.compare_card.grid_remove()
+
+            self._refresh_history_tab()
+            return
+
+        self.miss_guard_card.grid_remove()
         self.lbl_status.configure(text="● Match Found", text_color="#4CAF50")
         self.lbl_preceding.configure(text=result.preceding)
         self.lbl_target.configure(text=result.target)
@@ -1737,6 +1820,8 @@ class PiPhoneApp(ctk.CTk):
         self._is_searching = False
         self.prog_bar.stop()
         self.prog_bar.grid_remove()
+        self.compare_card.grid_remove()
+        self.miss_guard_card.grid_remove()
         self.btn_action.configure(
             text="Find in Pi",
             fg_color="#2E7D32",

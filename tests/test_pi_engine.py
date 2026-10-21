@@ -1309,3 +1309,40 @@ def test_tc32_compare_engines_back_to_back(tmp_path: Path):
     assert res_bin_4.position == 1
     assert "Fallback: Standard Engine" in res_bin_4.source
 
+
+# =====================================================================
+# TC-33: Safe-RAM Index Miss Guard & Memory Cleanup
+# =====================================================================
+def test_tc33_safe_ram_index_miss_guard(tmp_path: Path):
+    """
+    TC-33: Verify Safe-RAM Index Miss Guard:
+    - When cached_digits >= 100M and a 10-digit number is not in index/seed,
+      gracefully reports [Index Miss: Not found in current X.XM cached digits (X.XX% coverage)]
+      with position == 0 without launching unbounded live calculation.
+    """
+    import gc
+    engine = PiEngine(data_dir=tmp_path, default_seed_digits=1000, load_seed_pack=False)
+
+    # Create mock index file with max_pi_digit_scanned = 340,700,000
+    m_path = tmp_path / "mock_340m.piidx"
+    with open(m_path, "wb") as f:
+        f.write(encode_header(BinaryIndexMode.STRAGGLER_SORTED_10B, 0, 340_700_000))
+
+    engine.load_binary_index(m_path)
+    assert engine.binary_index is not None
+    assert engine.binary_index.max_pi_digit_scanned == 340_700_000
+
+    # Search a non-existent 10-digit number in Binary Index mode
+    res_miss = engine.search("9999999999", engine_mode=SearchEngineMode.BINARY_INDEX_ENGINE)
+    assert res_miss is not None
+    assert res_miss.position == 0
+    assert "[Index Miss: Not found in current 340.7M cached digits (3.41% coverage)]" in res_miss.source
+    assert res_miss.engine_mode == "Binary Index (Miss)"
+    assert res_miss.new_digits_calculated == 0
+
+    # Verify memory cleanup on unload
+    engine.unload_binary_index()
+    assert engine.binary_index is None
+    gc.collect()
+
+

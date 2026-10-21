@@ -97,6 +97,14 @@ This document outlines completed milestones, planned enhancements, architectural
   * Index Manager GUI Dialog (`IndexManagerDialog` in `piphone.py`) to inspect, load, unload, and build `.piidx` files.
   * Side-by-side performance comparison mode (`Compare Both` checkbox) executing back-to-back benchmark runs and reporting speedup factor.
 
+### FB-16: Safe-RAM Index Miss Guard & Enhanced Threading / Memory Cleanup
+* **Status**: **Completed (v2.4 Stability Update)**
+* **Implementation**:
+  * Safe-RAM Index Miss Guard catching 10-digit misses on deep caches ($\ge 100\text{M}$ digits), reporting `[Index Miss: Not found in current 340.7M cached digits (3.41% coverage)]` without triggering unbounded live calculations.
+  * Added non-blocking prompt card (`miss_guard_card`) with `[⚡ Run Live Calculation Burst]` button allowing user-initiated calculations.
+  * Ensured all index loading, mmap file operations, and index building run exclusively in background `daemon=True` threads communicating via `root.after()`.
+  * Integrated explicit `gc.collect()` calls and automatic 1.25 GB bitset buffer deallocation across builder, engine, and UI routines.
+
 ---
 
 ## 2. Active Backlog Items

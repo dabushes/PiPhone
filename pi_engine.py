@@ -7,6 +7,7 @@ Timsort-maintained binary search indexing, and thread-safe chunk expansion.
 from __future__ import annotations
 
 import bisect
+import gc
 import json
 import math
 import os
@@ -571,6 +572,7 @@ class PiEngine:
             temp_dest.replace(dest)
 
         file_size = dest.stat().st_size
+        gc.collect()
         return {
             "digits_count": len(digits_to_export),
             "path": str(dest),
@@ -629,6 +631,7 @@ class PiEngine:
             self.prefix_index.clear()
             self._sort_indices()
             self._save_index()
+            gc.collect()
 
         self._sync_seed_in_background()
         return digit_count
@@ -722,6 +725,7 @@ class PiEngine:
             idx = PiBinaryIndex(index_path)
             self.binary_index = idx
             self.binary_index_path = idx.path
+            gc.collect()
             return idx
 
     def unload_binary_index(self) -> None:
@@ -731,6 +735,7 @@ class PiEngine:
                 self.binary_index.close()
                 self.binary_index = None
                 self.binary_index_path = None
+                gc.collect()
 
     def _sort_indices(self) -> None:
         """Sorts query cache using Python's native Timsort."""
@@ -1130,8 +1135,44 @@ class PiEngine:
                 res.source = f"[Fallback: Standard Engine (1-9 digit query)] • {res.source}"
             return res
 
-        # Case C1: No binary index loaded -> Automatic fallback to Standard Engine
+        # Case C1: No binary index loaded -> Check cached seed, then guard if >= 100M
         if self.binary_index is None:
+            local_idx = self.digits.find(clean_query)
+            if local_idx != -1:
+                global_pos = local_idx + 1
+                elapsed = time.perf_counter() - start_time
+                self.record_query_match(clean_query, global_pos)
+                preceding, target, following = format_context(self.digits, global_pos, len(clean_query))
+                return SearchResult(
+                    query=clean_query,
+                    position=global_pos,
+                    preceding=preceding,
+                    target=target,
+                    following=following,
+                    elapsed_seconds=elapsed,
+                    source="[No Index Loaded -> Fallback: Standard Engine] • Sorted Index Cache",
+                    new_digits_calculated=0,
+                    engine_mode="Binary Index (No Index Loaded)",
+                )
+
+            cached_digits = len(self.digits)
+            if cached_digits >= 100_000_000:
+                elapsed = time.perf_counter() - start_time
+                cached_m = cached_digits / 1_000_000.0
+                coverage = (cached_digits / 10_000_000_000.0) * 100.0
+                miss_msg = f"[Index Miss: Not found in current {cached_m:.1f}M cached digits ({coverage:.2f}% coverage)]"
+                return SearchResult(
+                    query=clean_query,
+                    position=0,
+                    preceding="",
+                    target=clean_query,
+                    following="",
+                    elapsed_seconds=elapsed,
+                    source=miss_msg,
+                    new_digits_calculated=0,
+                    engine_mode="Binary Index (Miss)",
+                )
+
             res = self._search_standard(
                 query=clean_query,
                 chunk_size=chunk_size,
@@ -1176,7 +1217,43 @@ class PiEngine:
                 engine_mode="Binary Index",
             )
 
-        # Case C2: Index Miss (number did not appear in scanned range)
+        # Check if present in remaining cached digits
+        local_idx = self.digits.find(clean_query)
+        if local_idx != -1:
+            global_pos = local_idx + 1
+            elapsed = time.perf_counter() - start_time
+            self.record_query_match(clean_query, global_pos)
+            return SearchResult(
+                query=clean_query,
+                position=global_pos,
+                preceding="",
+                target=clean_query,
+                following="",
+                elapsed_seconds=elapsed,
+                source=f"[Engine: 10-Digit Binary Index (Hit in cached seed in {format_latency(elapsed)})]",
+                new_digits_calculated=0,
+                engine_mode="Binary Index",
+            )
+
+        # Case C2: Index Miss (number did not appear in scanned range or cached seed)
+        cached_digits = max(len(self.digits), b_idx.max_pi_digit_scanned)
+        if cached_digits >= 100_000_000:
+            elapsed = time.perf_counter() - start_time
+            cached_m = cached_digits / 1_000_000.0
+            coverage = (cached_digits / 10_000_000_000.0) * 100.0
+            miss_msg = f"[Index Miss: Not found in current {cached_m:.1f}M cached digits ({coverage:.2f}% coverage)]"
+            return SearchResult(
+                query=clean_query,
+                position=0,
+                preceding="",
+                target=clean_query,
+                following="",
+                elapsed_seconds=elapsed,
+                source=miss_msg,
+                new_digits_calculated=0,
+                engine_mode="Binary Index (Miss)",
+            )
+
         max_scanned = b_idx.max_pi_digit_scanned
         res = self._search_standard(
             query=clean_query,
@@ -1488,6 +1565,8 @@ class PiEngine:
                     with open(self.digits_file, "a", encoding="ascii") as f:
                         f.write(new_slice)
                     self._save_index()
+                    del new_slice
+                    gc.collect()
                 self._sync_seed_in_background()
 
                 report_progress(len(self.digits), time.perf_counter() - start_time)
@@ -1560,6 +1639,8 @@ class PiEngine:
                     with open(self.digits_file, "a", encoding="ascii") as f:
                         f.write(new_slice)
                     self._save_index()
+                    del new_slice
+                    gc.collect()
             self._sync_seed_in_background()
 
     def log_history(self, result: SearchResult) -> None:
